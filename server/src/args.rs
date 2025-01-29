@@ -5,9 +5,9 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Tunnel server port
+    /// Port server uses to listen for upstream clients
     #[arg(short, long)]
-    pub port: u16,
+    pub listen: u16,
 
     /// Path to TLS certificate
     #[arg(short, long)]

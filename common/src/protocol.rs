@@ -1,17 +1,10 @@
-use std::{
-    collections::HashMap,
-    fmt, io,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use clap::ValueEnum;
-use httparse;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::Mutex,
 };
@@ -157,34 +150,6 @@ pub enum Error {
     ConnectionError(String),
 }
 
-pub struct TlsWriter<'a> {
-    inner: &'a mut BufReader<TlsStream<TcpStream>>,
-}
-
-impl<'a> TlsWriter<'a> {
-    pub fn new(inner: &'a mut BufReader<TlsStream<TcpStream>>) -> Self {
-        Self { inner }
-    }
-}
-
-impl<'a> AsyncWrite for TlsWriter<'a> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
 pub async fn write_message<T: Serialize>(stream: &mut TcpStream, message: &T) -> Result<()> {
     let serialized = bincode::serialize(message)?;
     let length = serialized.len() as u32;
@@ -202,42 +167,4 @@ pub async fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> Result
     let mut message_buf = vec![0u8; length];
     stream.read_exact(&mut message_buf).await?;
     Ok(bincode::deserialize(&message_buf)?)
-}
-
-pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-
-    let header_length = req.parse(buf)?.unwrap();
-    let method = req.method.unwrap_or_default().to_owned();
-    let path = req.path.unwrap_or_default().to_owned();
-    let version = req.version.unwrap_or_default();
-
-    let headers = req
-        .headers
-        .iter()
-        .map(|h| {
-            (
-                h.name.to_string(),
-                String::from_utf8_lossy(h.value).to_string(),
-            )
-        })
-        .collect();
-
-    let body = buf[header_length..].to_vec();
-
-    Ok(HttpRequest {
-        method,
-        path,
-        version,
-        headers,
-        body,
-    })
-}
-
-pub fn request_is_complete(buf: &[u8]) -> Result<bool> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-
-    Ok(req.parse(buf)?.is_complete())
 }

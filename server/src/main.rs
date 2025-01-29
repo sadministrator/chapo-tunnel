@@ -22,7 +22,7 @@ pub async fn main() -> Result<()> {
         domain: "todo.com".to_owned(),
         require_auth: false,
         auth_tokens: HashSet::new(),
-        port: args.port,
+        upstream_listen: args.listen,
         supported_protocols: args.protocols,
         cert_path: args.cert_path,
         key_path: args.key_path,

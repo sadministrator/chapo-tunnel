@@ -1,13 +1,16 @@
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
-use common::protocol;
+use common::{
+    protocol::{self, Data, DownstreamClient, HttpData, Message, ProtocolType, UpstreamClient},
+    utils::{self, TlsWriter},
+};
 use dashmap::DashMap;
 use rand::Rng;
 use rustls_pemfile::{self, certs};
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{
@@ -18,12 +21,12 @@ use tracing::{debug, error, info};
 
 pub struct Config {
     pub domain: String,
-    pub port: u16,
+    pub upstream_listen: u16,
 
     pub require_auth: bool,
     pub auth_tokens: HashSet<String>,
 
-    pub supported_protocols: Vec<protocol::ProtocolType>,
+    pub supported_protocols: Vec<ProtocolType>,
 
     pub cert_path: String,
     pub key_path: String,
@@ -31,10 +34,10 @@ pub struct Config {
 
 pub struct Server {
     // subdomain -> upstream client
-    pub upstream_clients: DashMap<String, protocol::UpstreamClient>,
+    pub upstream_clients: DashMap<String, UpstreamClient>,
 
     // stream ID -> downstream client
-    pub downstream_clients: DashMap<u32, protocol::DownstreamClient>,
+    pub downstream_clients: DashMap<u32, DownstreamClient>,
 
     pub config: Config,
 }
@@ -65,30 +68,31 @@ impl Server {
     }
 
     async fn listen_upstream(&self) -> Result<()> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
+        let listener =
+            TcpListener::bind(format!("0.0.0.0:{}", self.config.upstream_listen)).await?;
         info!(
             "Listening for upstream clients at port {}",
-            self.config.port
+            self.config.upstream_listen
         );
 
         while let Ok((mut stream, addr)) = listener.accept().await {
             info!("New upstream connection initiated by {addr}");
 
-            let handshake: protocol::Message = protocol::read_message(&mut stream).await?;
+            let handshake: Message = protocol::read_message(&mut stream).await?;
             debug!("Received handshake: {:?}", handshake);
 
             match handshake {
-                protocol::Message::HandshakeRequest {
+                Message::HandshakeRequest {
                     supported_version,
                     supported_protocols,
                     auth_token,
                 } => {
-                    let accepted_protocols: Vec<protocol::ProtocolType> = supported_protocols
+                    let accepted_protocols: Vec<ProtocolType> = supported_protocols
                         .into_iter()
                         .filter(|p| self.config.supported_protocols.contains(p))
                         .collect();
                     let subdomain = self.generate_subdomain()?;
-                    let response = protocol::Message::HandshakeResponse {
+                    let response = Message::HandshakeResponse {
                         accepted_protocols: accepted_protocols.clone(),
                         accepted_version: supported_version,
                         subdomain: subdomain.clone(),
@@ -97,7 +101,7 @@ impl Server {
                     protocol::write_message(&mut stream, &response).await?;
                     debug!("Handshake response sent");
 
-                    let connection = protocol::UpstreamClient::new(stream, accepted_protocols);
+                    let connection = UpstreamClient::new(stream, accepted_protocols);
 
                     self.upstream_clients.insert(subdomain.clone(), connection);
                     info!("{addr} added to upstream connections with subdomain \"{subdomain}\"");
@@ -138,24 +142,23 @@ impl Server {
     async fn handle_connection(
         downstream: TcpStream,
         acceptor: TlsAcceptor,
-        upstream_clients: DashMap<String, protocol::UpstreamClient>,
-        downstream_clients: DashMap<u32, protocol::DownstreamClient>,
+        upstream_clients: DashMap<String, UpstreamClient>,
+        downstream_clients: DashMap<u32, DownstreamClient>,
     ) -> Result<()> {
         let tls_stream = acceptor.accept(downstream).await?;
         let tls_reader = BufReader::new(tls_stream);
         let stream_id = rand::thread_rng().gen();
-        downstream_clients.insert(stream_id, protocol::DownstreamClient::new(tls_reader));
+        downstream_clients.insert(stream_id, DownstreamClient::new(tls_reader));
 
         loop {
             let downstream = downstream_clients
                 .get(&stream_id)
-                .ok_or(anyhow!("Couldn't find downstream for ID {stream_id}"))
-                .unwrap();
+                .ok_or(anyhow!("Missing downstream for ID {stream_id}"))?;
             let mut downstream = downstream.stream.lock().await;
 
             let mut buf = vec![0u8; 1024];
             let n = downstream.read(&mut buf).await?;
-            let request = protocol::parse_http_request(&buf[..n])?;
+            let request = utils::parse_http_request(&buf[..n])?;
             debug!("Received request from downstream: {:?}", request);
 
             let subdomain = request.path_subdomain()?;
@@ -164,30 +167,27 @@ impl Server {
                 .get(&subdomain)
                 .ok_or(anyhow!("No upstream found for subdomain \"{subdomain}\""))?;
 
-            // todo: check whether request is large enough to stream, if so, create stream ID and send StreamOpen message to upstream
-            // does the client already take care of doing this (by streaming request if it's large enough)? if so, what would the initial request look like?
-            let message =
-                protocol::Message::Data(protocol::Data::Http(protocol::HttpData::Request(request)));
+            let message = Message::Data(Data::Http(HttpData::Request(request)));
 
             let mut upstream = upstream.stream.lock().await;
             protocol::write_message(&mut upstream, &message).await?;
             debug!("Sent upstream: {:?}", message);
 
             loop {
-                let response: protocol::Message = protocol::read_message(&mut upstream).await?;
+                let response: Message = protocol::read_message(&mut upstream).await?;
                 debug!("Received from upstream: {:?}", response);
 
                 match response {
-                    protocol::Message::Data(protocol::Data::Http(http_data)) => match http_data {
-                        protocol::HttpData::BodyChunk {
+                    Message::Data(Data::Http(http_data)) => match http_data {
+                        HttpData::BodyChunk {
                             stream_id: chunk_id,
                             data,
                             is_end,
                         } => {
                             debug!("Received chunk from upstream {chunk_id}");
                             if chunk_id == stream_id {
-                                let mut downwriter = protocol::TlsWriter::new(&mut downstream);
-                                Self::write_chunk(&mut downwriter, &data).await?;
+                                let mut downwriter = TlsWriter::new(&mut downstream);
+                                downwriter.write_chunk(&data).await?;
 
                                 if is_end {
                                     downstream.write_all(b"0\r\n\r\n").await?;
@@ -198,7 +198,7 @@ impl Server {
                                 }
                             }
                         }
-                        protocol::HttpData::Response(http_response) => {
+                        HttpData::Response(http_response) => {
                             let mut response_string =
                                 format!("HTTP/1.1 {}\r\n", http_response.status);
                             let is_streaming = http_response
@@ -216,8 +216,8 @@ impl Server {
 
                             if !http_response.body.is_empty() {
                                 if is_streaming {
-                                    let mut downwriter = protocol::TlsWriter::new(&mut downstream);
-                                    Self::write_chunk(&mut downwriter, &http_response.body).await?;
+                                    let mut downwriter = TlsWriter::new(&mut downstream);
+                                    downwriter.write_chunk(&http_response.body).await?;
                                 } else {
                                     downstream.write_all(&http_response.body).await?;
                                 }
@@ -228,11 +228,11 @@ impl Server {
                                 break;
                             }
                         }
-                        protocol::HttpData::Request(http_request) => {
+                        HttpData::Request(http_request) => {
                             debug!("Received unexpected request from upstream client")
                         }
                     },
-                    protocol::Message::StreamClose {
+                    Message::StreamClose {
                         stream_id: closed_id,
                     } => {
                         if closed_id == stream_id {
@@ -244,17 +244,6 @@ impl Server {
                 }
             }
         }
-    }
-
-    async fn write_chunk<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
-        if !data.is_empty() {
-            let size_line = format!("{:x}\r\n", data.len());
-            writer.write_all(size_line.as_bytes()).await?;
-            writer.write_all(data).await?;
-            writer.write_all(b"\r\n").await?;
-        }
-
-        Ok(())
     }
 
     async fn create_tls_config(&self) -> Result<ServerConfig> {

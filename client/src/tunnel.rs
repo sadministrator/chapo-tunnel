@@ -1,5 +1,5 @@
 use anyhow::Result;
-use common::protocol;
+use common::protocol::{self, Data, HttpData, HttpResponse, Message, ProtocolType};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
@@ -7,7 +7,7 @@ pub struct Config {
     file_server_port: u16,
     remote_host: String,
     remote_port: u16,
-    supported_protocols: Vec<protocol::ProtocolType>,
+    supported_protocols: Vec<ProtocolType>,
     supported_version: String,
     auth_token: Option<String>,
 }
@@ -17,7 +17,7 @@ impl Config {
         file_server_port: u16,
         remote_host: String,
         remote_port: u16,
-        supported_protocols: Vec<protocol::ProtocolType>,
+        supported_protocols: Vec<ProtocolType>,
         supported_version: String,
         auth_token: Option<String>,
     ) -> Self {
@@ -49,7 +49,7 @@ impl Client {
         .await?;
         info!("Connected to tunnel server {}", self.config.remote_host);
 
-        let request = protocol::Message::HandshakeRequest {
+        let request = Message::HandshakeRequest {
             supported_version: self.config.supported_version,
             supported_protocols: self.config.supported_protocols,
             auth_token: self.config.auth_token,
@@ -58,11 +58,11 @@ impl Client {
         protocol::write_message(&mut tunnel_server, &request).await?;
         debug!("Handshake request sent");
 
-        let response: protocol::Message = protocol::read_message(&mut tunnel_server).await?;
+        let response: Message = protocol::read_message(&mut tunnel_server).await?;
         debug!("Received handshake: {:?}", response);
 
         match response {
-            protocol::Message::HandshakeResponse {
+            Message::HandshakeResponse {
                 accepted_version,
                 accepted_protocols,
                 subdomain,
@@ -73,13 +73,13 @@ impl Client {
         };
 
         loop {
-            let data: protocol::Message = protocol::read_message(&mut tunnel_server).await?;
+            let data: Message = protocol::read_message(&mut tunnel_server).await?;
             debug!("Received from tunnel server: {:?}", data);
 
             match data {
-                protocol::Message::Data(protocol::Data::Http(http_data)) => {
+                Message::Data(Data::Http(http_data)) => {
                     match http_data {
-                        protocol::HttpData::Request(http_request) => {
+                        HttpData::Request(http_request) => {
                             let http_client = reqwest::Client::new();
                             let http_response = http_client
                                 .get(format!(
@@ -90,8 +90,8 @@ impl Client {
                                 .await?;
                             debug!("Received from file server {:?}", http_response);
 
-                            let http_message = protocol::Message::Data(protocol::Data::Http(
-                                protocol::HttpData::Response(protocol::HttpResponse {
+                            let http_message =
+                                Message::Data(Data::Http(HttpData::Response(HttpResponse {
                                     status: http_response.status().into(),
                                     headers: http_response
                                         .headers()
@@ -101,20 +101,19 @@ impl Client {
                                         })
                                         .collect(),
                                     body: http_response.bytes().await?.to_vec(),
-                                }),
-                            ));
+                                })));
 
                             protocol::write_message(&mut tunnel_server, &http_message).await?;
                             debug!("Forwarded file to tunnel server");
                         }
-                        protocol::HttpData::Response(protocol::HttpResponse {
+                        HttpData::Response(HttpResponse {
                             status,
                             headers,
                             body,
                         }) => {
                             todo!("return 400 Bad Request")
                         }
-                        protocol::HttpData::BodyChunk {
+                        HttpData::BodyChunk {
                             stream_id,
                             data,
                             is_end,
@@ -123,8 +122,8 @@ impl Client {
                         }
                     };
                 }
-                protocol::Message::Data(protocol::Data::Tcp(tcp_data)) => todo!(),
-                protocol::Message::Data(protocol::Data::Udp(udp_data)) => todo!(),
+                Message::Data(Data::Tcp(tcp_data)) => todo!(),
+                Message::Data(Data::Udp(udp_data)) => todo!(),
                 _ => todo!(),
             };
         }
