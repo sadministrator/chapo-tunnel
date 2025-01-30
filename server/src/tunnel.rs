@@ -1,9 +1,8 @@
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
-use common::{
-    protocol::{self, Data, DownstreamClient, HttpData, Message, ProtocolType, UpstreamClient},
-    utils::{self, TlsWriter},
+use common::protocol::{
+    self, Data, DownstreamClient, HttpData, Message, ProtocolType, UpstreamClient,
 };
 use dashmap::DashMap;
 use rand::Rng;
@@ -18,6 +17,8 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 use tracing::{debug, error, info};
+
+use crate::utils::{self, TlsWriter};
 
 pub struct Config {
     pub domain: String,
@@ -54,7 +55,7 @@ impl Server {
         }
     }
 
-    pub async fn start(self: Arc<Self>) -> Result<()> {
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         let upstream = self.clone();
         let downstream = self.clone();
 

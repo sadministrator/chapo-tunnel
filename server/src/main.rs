@@ -1,5 +1,6 @@
 mod args;
 mod tunnel;
+mod utils;
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -30,5 +31,5 @@ pub async fn main() -> Result<()> {
     let server = Arc::new(Server::new(config));
 
     info!("Starting server...");
-    server.start().await
+    server.run().await
 }

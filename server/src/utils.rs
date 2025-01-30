@@ -5,14 +5,13 @@ use std::{
 };
 
 use anyhow::Result;
+use common::protocol::HttpRequest;
 use httparse;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 use tokio_rustls::server::TlsStream;
-
-use crate::protocol::HttpRequest;
 
 pub struct TlsWriter<'a> {
     inner: &'a mut BufReader<TlsStream<TcpStream>>,
