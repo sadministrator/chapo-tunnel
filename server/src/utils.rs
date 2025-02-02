@@ -23,6 +23,24 @@ impl<'a> TlsWriter<'a> {
     }
 }
 
+impl<'a> TlsWriter<'a> {
+    pub async fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        if !data.is_empty() {
+            let size_line = format!("{:x}\r\n", data.len());
+            self.write_all(size_line.as_bytes()).await?;
+            self.write_all(data).await?;
+            self.write_all(b"\r\n").await?;
+        }
+        Ok(())
+    }
+
+    pub async fn write_final_chunk(&mut self) -> Result<()> {
+        self.write_all(b"0\r\n\r\n").await?;
+        self.flush().await?;
+        Ok(())
+    }
+}
+
 impl<'a> AsyncWrite for TlsWriter<'a> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -38,19 +56,6 @@ impl<'a> AsyncWrite for TlsWriter<'a> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-impl<'a> TlsWriter<'a> {
-    pub async fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
-        if !data.is_empty() {
-            let size_line = format!("{:x}\r\n", data.len());
-            self.write_all(size_line.as_bytes()).await?;
-            self.write_all(data).await?;
-            self.write_all(b"\r\n").await?;
-        }
-
-        Ok(())
     }
 }
 

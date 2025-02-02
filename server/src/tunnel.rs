@@ -118,7 +118,7 @@ impl Server {
         let tls_config = Arc::new(self.create_tls_config().await?);
         let acceptor = TlsAcceptor::from(tls_config);
         let listener = TcpListener::bind("0.0.0.0:4433").await?;
-        info!("Listening for HTTPS");
+        info!("Listening downstream for HTTPS");
 
         while let Ok((stream, addr)) = listener.accept().await {
             info!("New HTTPS connection from: {addr}");
@@ -146,103 +146,171 @@ impl Server {
         upstream_clients: DashMap<String, UpstreamClient>,
         downstream_clients: DashMap<u32, DownstreamClient>,
     ) -> Result<()> {
+        const STREAM_THRESHOLD: usize = 1024;
+
         let tls_stream = acceptor.accept(downstream).await?;
         let tls_reader = BufReader::new(tls_stream);
-        let stream_id = rand::thread_rng().gen();
-        downstream_clients.insert(stream_id, DownstreamClient::new(tls_reader));
+        let downstream = DownstreamClient::new(tls_reader);
 
         loop {
-            let downstream = downstream_clients
-                .get(&stream_id)
-                .ok_or(anyhow!("Missing downstream for ID {stream_id}"))?;
             let mut downstream = downstream.stream.lock().await;
-
             let mut buf = vec![0u8; 1024];
             let n = downstream.read(&mut buf).await?;
             let request = utils::parse_http_request(&buf[..n])?;
-            debug!("Received request from downstream: {:?}", request);
+            debug!("Received from downstream: {:?}", request);
 
             let subdomain = request.path_subdomain()?;
-
             let upstream = upstream_clients
                 .get(&subdomain)
                 .ok_or(anyhow!("No upstream found for subdomain \"{subdomain}\""))?;
-
-            let message = Message::Data(Data::Http(HttpData::Request(request)));
-
             let mut upstream = upstream.stream.lock().await;
-            protocol::write_message(&mut upstream, &message).await?;
-            debug!("Sent upstream: {:?}", message);
 
-            loop {
-                let response: Message = protocol::read_message(&mut upstream).await?;
-                debug!("Received from upstream: {:?}", response);
+            let is_chunked = request
+                .headers
+                .get("transfer-encoding")
+                .map_or(false, |v| v.eq_ignore_ascii_case("chunked"));
+            let content_len = request
+                .headers
+                .get("content-length")
+                .and_then(|v| v.parse::<usize>().ok());
 
-                match response {
-                    Message::Data(Data::Http(http_data)) => match http_data {
-                        HttpData::BodyChunk {
-                            stream_id: chunk_id,
-                            data,
-                            is_end,
-                        } => {
-                            debug!("Received chunk from upstream {chunk_id}");
-                            if chunk_id == stream_id {
+            if !is_chunked || content_len.is_some_and(|len| len < STREAM_THRESHOLD) {
+                let message = Message::Data(Data::Http(HttpData::Request(request)));
+
+                protocol::write_message(&mut upstream, &message).await?;
+                debug!("Forwarded request upstream: {:?}", message);
+            } else {
+                let stream_id: u32 = rand::thread_rng().gen();
+                let stream_open: Message = Message::StreamOpen {
+                    stream_id,
+                    protocol: ProtocolType::Http,
+                };
+                protocol::write_message(&mut upstream, &stream_open).await?;
+
+                loop {
+                    let mut buf = [0u8; 1024];
+                    let n = downstream.read(&mut buf).await?;
+                    let is_end = n == 0;
+                    let chunk = Message::Data(Data::Http(HttpData::BodyChunk {
+                        stream_id,
+                        data: buf[..n].to_vec(),
+                        is_end,
+                    }));
+                    protocol::write_message(&mut upstream, &chunk).await?;
+
+                    if is_end {
+                        break;
+                    }
+                }
+            }
+
+            let response: Message = protocol::read_message(&mut upstream).await?;
+            debug!("Received from upstream: {:?}", response);
+
+            match response {
+                Message::StreamOpen {
+                    stream_id,
+                    protocol,
+                } => {
+                    debug!("Upstream at {subdomain} opened stream {stream_id}");
+                    loop {
+                        let stream_chunk: Message = protocol::read_message(&mut upstream).await?;
+                        match stream_chunk {
+                            Message::Data(Data::Http(HttpData::BodyChunk {
+                                stream_id,
+                                mut data,
+                                is_end,
+                            })) => {
                                 let mut downwriter = TlsWriter::new(&mut downstream);
-                                downwriter.write_chunk(&data).await?;
+                                downwriter.write(&data).await?;
 
                                 if is_end {
-                                    downstream.write_all(b"0\r\n\r\n").await?;
-                                    downstream.flush().await?;
-
-                                    downstream_clients.remove(&stream_id);
-                                    break;
+                                    downwriter.flush().await?;
                                 }
                             }
-                        }
-                        HttpData::Response(http_response) => {
-                            let mut response_string =
-                                format!("HTTP/1.1 {}\r\n", http_response.status);
-                            let is_streaming = http_response
-                                .headers
-                                .get("Transfer-Encoding")
-                                .map(|v| v.to_lowercase().contains("chunked"))
-                                .unwrap_or(false);
-
-                            for (key, value) in &http_response.headers {
-                                response_string.push_str(&format!("{}: {}\r\n", key, value));
+                            Message::StreamClose { stream_id } => {
+                                debug!("Upstream at {subdomain} closed stream {stream_id}");
+                                break;
                             }
-                            response_string.push_str("\r\n");
+                            _ => {
+                                error!(
+                                    "Received unexpected message from upstream: {:?}",
+                                    stream_chunk
+                                );
 
-                            downstream.write_all(response_string.as_bytes()).await?;
-
-                            if !http_response.body.is_empty() {
-                                if is_streaming {
-                                    let mut downwriter = TlsWriter::new(&mut downstream);
-                                    downwriter.write_chunk(&http_response.body).await?;
-                                } else {
-                                    downstream.write_all(&http_response.body).await?;
-                                }
-                            }
-
-                            if !is_streaming {
-                                downstream.flush().await?;
+                                let stream_close = Message::StreamClose { stream_id };
+                                protocol::write_message(&mut upstream, &stream_close).await?;
                                 break;
                             }
                         }
-                        HttpData::Request(http_request) => {
-                            debug!("Received unexpected request from upstream client")
+                    }
+                }
+                Message::Data(Data::Http(http_data)) => match http_data {
+                    HttpData::Response(http_response) => {
+                        let mut response_string = format!("HTTP/1.1 {}\r\n", http_response.status);
+                        let is_chunked = http_response
+                            .headers
+                            .get("transfer-encoding")
+                            .map_or(false, |v| v.eq_ignore_ascii_case("chunked"));
+
+                        for (key, value) in &http_response.headers {
+                            response_string.push_str(&format!("{}: {}\r\n", key, value));
                         }
-                    },
-                    Message::StreamClose {
-                        stream_id: closed_id,
-                    } => {
-                        if closed_id == stream_id {
-                            downstream_clients.remove(&stream_id);
-                            break;
+                        response_string.push_str("\r\n");
+
+                        downstream.write_all(response_string.as_bytes()).await?;
+                        debug!("Sent response header to downstream");
+
+                        let mut downwriter = TlsWriter::new(&mut downstream);
+
+                        if !http_response.body.is_empty() {
+                            if is_chunked {
+                                downwriter.write_chunk(&http_response.body).await?;
+                            } else {
+                                downwriter.write_all(&http_response.body).await?;
+                            }
+                        }
+
+                        if is_chunked {
+                            downwriter.write_final_chunk().await?;
+                        } else {
+                            downstream.flush().await?;
                         }
                     }
-                    _ => debug!("Upstream client response was malformed"),
-                }
+                    HttpData::Request(http_request) => {
+                        error!("Received unexpected request from upstream client")
+                    }
+                    HttpData::BodyChunk {
+                        stream_id,
+                        data,
+                        is_end,
+                    } => {
+                        error!("Received unexpected chunk from upstream {subdomain} with stream ID {stream_id}");
+
+                        let stream_close = Message::StreamClose { stream_id };
+                        protocol::write_message(&mut upstream, &stream_close).await?;
+                    }
+                },
+                Message::Data(d) => error!(
+                    "Received unexpected data of unexpected protocol type: {:?}",
+                    d
+                ),
+                Message::StreamClose {
+                    stream_id: closed_id,
+                } => error!("Received unexpected stream close from upstream {subdomain}"),
+                Message::HandshakeRequest {
+                    supported_version,
+                    supported_protocols,
+                    auth_token,
+                } => error!("Received unexpected handshake request from upstream {subdomain}"),
+                Message::HandshakeResponse {
+                    accepted_version,
+                    accepted_protocols,
+                    subdomain,
+                } => error!("Received unexpected handshake response from upstream {subdomain}"),
+                Message::Ping(v) => debug!("Received ping {v} from upstream {subdomain}"),
+                Message::Pong(v) => debug!("Received pong {v} from upstream {subdomain}"),
+                Message::Error(e) => error!("Message protocol error: {:?}", e),
             }
         }
     }
