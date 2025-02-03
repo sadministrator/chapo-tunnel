@@ -150,16 +150,16 @@ impl Server {
 
         let tls_stream = acceptor.accept(downstream).await?;
         let tls_reader = BufReader::new(tls_stream);
-        let downstream = DownstreamClient::new(tls_reader);
+        let downstream_client = DownstreamClient::new(tls_reader);
 
         loop {
-            let mut downstream = downstream.stream.lock().await;
+            let mut downstream = downstream_client.stream.lock().await;
             let mut buf = vec![0u8; 1024];
             let n = downstream.read(&mut buf).await?;
             let request = utils::parse_http_request(&buf[..n])?;
             debug!("Received from downstream: {:?}", request);
 
-            let subdomain = request.path_subdomain()?;
+            let subdomain = utils::extract_subdomain(&request)?;
             let upstream = upstream_clients
                 .get(&subdomain)
                 .ok_or(anyhow!("No upstream found for subdomain \"{subdomain}\""))?;
@@ -221,6 +221,7 @@ impl Server {
                                 mut data,
                                 is_end,
                             })) => {
+                                debug!("Received chunk from upstream at {subdomain}");
                                 let mut downwriter = TlsWriter::new(&mut downstream);
                                 downwriter.write(&data).await?;
 

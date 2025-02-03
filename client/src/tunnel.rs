@@ -122,8 +122,8 @@ impl Client {
                         }
                     };
                 }
-                Message::Data(Data::Tcp(tcp_data)) => todo!(),
-                Message::Data(Data::Udp(udp_data)) => todo!(),
+                Message::Data(Data::Tcp { stream_id, data }) => todo!(),
+                Message::Data(Data::Udp { addr, port, data }) => todo!(),
                 _ => todo!(),
             };
         }

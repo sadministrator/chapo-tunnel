@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use common::protocol::HttpRequest;
 use httparse;
 use tokio::{
@@ -95,4 +95,18 @@ pub fn request_is_complete(buf: &[u8]) -> Result<bool> {
     let mut req = httparse::Request::new(&mut headers);
 
     Ok(req.parse(buf)?.is_complete())
+}
+
+pub fn extract_subdomain(request: &HttpRequest) -> Result<String> {
+    let host = request
+        .headers
+        .get("Host")
+        .ok_or(anyhow!("Host missing from request"))?;
+    let subdomain = host
+        .split('.')
+        .next()
+        .ok_or(anyhow!("Subdomain missing from request"))?
+        .to_owned();
+
+    Ok(subdomain)
 }

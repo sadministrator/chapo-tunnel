@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::ValueEnum;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
@@ -73,8 +73,15 @@ pub enum ProtocolType {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Data {
     Http(HttpData),
-    Tcp(TcpData),
-    Udp(UdpData),
+    Tcp {
+        stream_id: u32,
+        data: Vec<u8>,
+    },
+    Udp {
+        addr: String,
+        port: u16,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -97,22 +104,6 @@ pub struct HttpRequest {
     pub version: u8,
 }
 
-impl HttpRequest {
-    pub fn path_subdomain(&self) -> Result<String> {
-        let host = self
-            .headers
-            .get("Host")
-            .ok_or(anyhow!("Host missing from request"))?;
-        let subdomain = host
-            .split('.')
-            .next()
-            .ok_or(anyhow!("Subdomain missing from request"))?
-            .to_owned();
-
-        Ok(subdomain)
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -128,19 +119,6 @@ impl fmt::Debug for HttpResponse {
             .field("body", &format!("[{} bytes]", self.body.len()))
             .finish()
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TcpData {
-    pub stream_id: u32,
-    pub data: Vec<u8>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct UdpData {
-    pub addr: String,
-    pub port: u16,
-    pub data: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
