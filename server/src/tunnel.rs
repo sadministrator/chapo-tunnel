@@ -2,7 +2,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use common::protocol::{
-    self, Data, DownstreamClient, HttpData, Message, ProtocolType, UpstreamClient,
+    self, Data, DownstreamClient, HttpData, Message, ProtocolType, Tunnel, UpstreamClient,
 };
 use dashmap::DashMap;
 use rand::Rng;
@@ -37,8 +37,8 @@ pub struct Server {
     // subdomain -> upstream client
     pub upstream_clients: DashMap<String, UpstreamClient>,
 
-    // stream ID -> downstream client
-    pub downstream_clients: DashMap<u32, DownstreamClient>,
+    // stream ID -> tunnel
+    pub tunnels: DashMap<u32, Tunnel>,
 
     pub config: Config,
 }
@@ -46,11 +46,11 @@ pub struct Server {
 impl Server {
     pub fn new(config: Config) -> Self {
         let upstream_clients = DashMap::new();
-        let downstream_clients = DashMap::new();
+        let tunnels = DashMap::new();
 
         Self {
             upstream_clients,
-            downstream_clients,
+            tunnels,
             config,
         }
     }
@@ -125,12 +125,11 @@ impl Server {
 
             let acceptor = acceptor.clone();
             let upstream_clients = self.upstream_clients.clone();
-            let downstream_clients = self.downstream_clients.clone();
+            let tunnels = self.tunnels.clone();
 
             tokio::spawn(async move {
                 if let Err(e) =
-                    Self::handle_connection(stream, acceptor, upstream_clients, downstream_clients)
-                        .await
+                    Self::handle_connection(stream, acceptor, upstream_clients, tunnels).await
                 {
                     error!("HTTPS connection error from {addr}: {e}");
                 }
@@ -144,7 +143,7 @@ impl Server {
         downstream: TcpStream,
         acceptor: TlsAcceptor,
         upstream_clients: DashMap<String, UpstreamClient>,
-        downstream_clients: DashMap<u32, DownstreamClient>,
+        tunnels: DashMap<u32, Tunnel>,
     ) -> Result<()> {
         const STREAM_THRESHOLD: usize = 1024;
 
@@ -160,10 +159,10 @@ impl Server {
             debug!("Received from downstream: {:?}", request);
 
             let subdomain = utils::extract_subdomain(&request)?;
-            let upstream = upstream_clients
+            let upstream_client = upstream_clients
                 .get(&subdomain)
                 .ok_or(anyhow!("No upstream found for subdomain \"{subdomain}\""))?;
-            let mut upstream = upstream.stream.lock().await;
+            let mut upstream = upstream_client.stream.lock().await;
 
             let is_chunked = request
                 .headers
@@ -181,6 +180,12 @@ impl Server {
                 debug!("Forwarded request upstream: {:?}", message);
             } else {
                 let stream_id: u32 = rand::thread_rng().gen();
+                let tunnel = Tunnel {
+                    upstream: upstream_client.clone(),
+                    downstream: downstream_client.clone(),
+                };
+                tunnels.insert(stream_id, tunnel);
+
                 let stream_open: Message = Message::StreamOpen {
                     stream_id,
                     protocol: ProtocolType::Http,
@@ -231,6 +236,7 @@ impl Server {
                             }
                             Message::StreamClose { stream_id } => {
                                 debug!("Upstream at {subdomain} closed stream {stream_id}");
+                                tunnels.remove(&stream_id);
                                 break;
                             }
                             _ => {

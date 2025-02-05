@@ -56,10 +56,25 @@ pub struct DownstreamClient {
 }
 
 impl DownstreamClient {
-    pub fn new(stream: BufReader<TlsStream<TcpStream>>) -> Self {
-        let stream = Arc::new(Mutex::new(stream));
+    pub fn new(tls_reader: BufReader<TlsStream<TcpStream>>) -> Self {
+        Self {
+            stream: Arc::new(Mutex::new(tls_reader)),
+        }
+    }
+}
 
-        Self { stream }
+#[derive(Clone, Debug)]
+pub struct Tunnel {
+    pub upstream: UpstreamClient,
+    pub downstream: DownstreamClient,
+}
+
+impl Tunnel {
+    pub fn new(upstream: UpstreamClient, downstream: DownstreamClient) -> Self {
+        Self {
+            upstream,
+            downstream,
+        }
     }
 }
 
