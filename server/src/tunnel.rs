@@ -5,7 +5,6 @@ use common::protocol::{
     self, Data, DownstreamClient, HttpData, Message, ProtocolType, Tunnel, UpstreamClient,
 };
 use dashmap::DashMap;
-use rand::Rng;
 use rustls_pemfile::{self, certs};
 use tokio::{
     fs::File,
@@ -179,17 +178,16 @@ impl Server {
                 protocol::write_message(&mut upstream, &message).await?;
                 debug!("Forwarded request upstream: {:?}", message);
             } else {
-                let stream_id: u32 = rand::thread_rng().gen();
                 let tunnel = Tunnel {
                     upstream: upstream_client.clone(),
                     downstream: downstream_client.clone(),
                 };
+                let stream_open: Message = Message::stream_open(ProtocolType::Http);
+                let Message::StreamOpen { stream_id, .. } = stream_open else {
+                    return Err(anyhow!("Expected stream open"));
+                };
                 tunnels.insert(stream_id, tunnel);
 
-                let stream_open: Message = Message::StreamOpen {
-                    stream_id,
-                    protocol: ProtocolType::Http,
-                };
                 protocol::write_message(&mut upstream, &stream_open).await?;
 
                 loop {

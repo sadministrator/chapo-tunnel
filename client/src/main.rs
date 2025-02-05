@@ -1,6 +1,7 @@
 mod args;
 mod file_server;
 mod tunnel;
+mod utils;
 
 use anyhow::Result;
 use args::Args;

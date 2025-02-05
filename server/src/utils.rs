@@ -83,7 +83,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
 
     Ok(HttpRequest {
         method,
-        path,
+        url: path,
         version,
         headers,
         body,

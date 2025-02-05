@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use anyhow::Result;
 use clap::ValueEnum;
+use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -33,6 +34,23 @@ pub enum Message {
     Pong(u64),
     Data(Data),
     Error(Error),
+}
+
+impl Message {
+    pub fn stream_open(protocol: ProtocolType) -> Self {
+        Self::StreamOpen {
+            stream_id: rand::rng().random(),
+            protocol,
+        }
+    }
+
+    pub fn http_chunk(stream_id: u32, data: Vec<u8>, is_end: bool) -> Self {
+        Self::Data(Data::Http(HttpData::BodyChunk {
+            stream_id,
+            data,
+            is_end,
+        }))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,7 +131,7 @@ pub enum HttpData {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HttpRequest {
     pub method: String,
-    pub path: String,
+    pub url: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub version: u8,

@@ -1,7 +1,17 @@
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 use common::protocol::{self, Data, HttpData, HttpResponse, Message, ProtocolType};
-use tokio::net::TcpStream;
+use dashmap::DashMap;
+use reqwest::Body;
+use tokio::{
+    net::TcpStream,
+    sync::mpsc::{self, Receiver, Sender},
+};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, info};
+
+use crate::utils::{self};
 
 pub struct Config {
     file_server_port: u16,
@@ -34,11 +44,15 @@ impl Config {
 
 pub struct Client {
     config: Config,
+    active_streams: DashMap<u32, Sender<Message>>,
 }
 
 impl Client {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            active_streams: DashMap::new(),
+        }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -50,83 +64,152 @@ impl Client {
         info!("Connected to tunnel server {}", self.config.remote_host);
 
         let request = Message::HandshakeRequest {
-            supported_version: self.config.supported_version,
-            supported_protocols: self.config.supported_protocols,
-            auth_token: self.config.auth_token,
+            supported_version: self.config.supported_version.clone(),
+            supported_protocols: self.config.supported_protocols.clone(),
+            auth_token: self.config.auth_token.clone(),
         };
 
-        protocol::write_message(&mut tunnel_server, &request).await?;
-        debug!("Handshake request sent");
+        loop {
+            protocol::write_message(&mut tunnel_server, &request).await?;
+            debug!("Handshake request sent");
 
-        let response: Message = protocol::read_message(&mut tunnel_server).await?;
-        debug!("Received handshake: {:?}", response);
+            let response: Message = protocol::read_message(&mut tunnel_server).await?;
+            debug!("Received handshake: {:?}", response);
 
-        match response {
-            Message::HandshakeResponse {
-                accepted_version,
-                accepted_protocols,
-                subdomain,
-            } => {
-                info!("Subdomain \"{subdomain}\" registered with tunnel server");
-            }
-            _ => todo!(),
-        };
+            match response {
+                Message::HandshakeResponse {
+                    accepted_version,
+                    accepted_protocols,
+                    subdomain,
+                } => {
+                    info!("Subdomain \"{subdomain}\" registered with tunnel server");
+                    break;
+                }
+                _ => {
+                    debug!(
+                        "Received unexpected message from tunnel server: {:?}",
+                        response
+                    );
+                    tokio::time::sleep(Duration::new(1, 0)).await;
+                }
+            };
+        }
 
         loop {
             let data: Message = protocol::read_message(&mut tunnel_server).await?;
             debug!("Received from tunnel server: {:?}", data);
 
             match data {
-                Message::Data(Data::Http(http_data)) => {
-                    match http_data {
-                        HttpData::Request(http_request) => {
-                            let http_client = reqwest::Client::new();
-                            let http_response = http_client
-                                .get(format!(
-                                    "http://localhost:{}{}",
-                                    self.config.file_server_port, http_request.path
-                                ))
-                                .send()
-                                .await?;
-                            debug!("Received from file server {:?}", http_response);
+                Message::StreamOpen {
+                    stream_id,
+                    protocol,
+                } => {
+                    debug!("Stream opened by tunnel server with ID {stream_id}");
+                    let (tx, rx) = mpsc::channel(32);
+                    self.active_streams.insert(stream_id, tx);
 
-                            let http_message =
-                                Message::Data(Data::Http(HttpData::Response(HttpResponse {
-                                    status: http_response.status().into(),
-                                    headers: http_response
-                                        .headers()
-                                        .into_iter()
-                                        .map(|(k, v)| {
-                                            (k.to_string(), v.to_str().unwrap().to_owned())
-                                        })
-                                        .collect(),
-                                    body: http_response.bytes().await?.to_vec(),
-                                })));
-
-                            protocol::write_message(&mut tunnel_server, &http_message).await?;
-                            debug!("Forwarded file to tunnel server");
-                        }
-                        HttpData::Response(HttpResponse {
-                            status,
-                            headers,
-                            body,
-                        }) => {
-                            todo!("return 400 Bad Request")
-                        }
-                        HttpData::BodyChunk {
-                            stream_id,
-                            data,
-                            is_end,
-                        } => {
-                            todo!("handle http chunks")
-                        }
-                    };
+                    self.handle_stream(rx, &mut tunnel_server).await?;
                 }
-                Message::Data(Data::Tcp { stream_id, data }) => todo!(),
-                Message::Data(Data::Udp { addr, port, data }) => todo!(),
+                Message::Data(Data::Http(HttpData::Request(http_request))) => {
+                    let http_client = reqwest::Client::new();
+                    let http_response = http_client
+                        .get(format!(
+                            "http://localhost:{}{}",
+                            self.config.file_server_port, http_request.url
+                        ))
+                        .send()
+                        .await?;
+                    debug!("Received from file server {:?}", http_response);
+
+                    let http_message =
+                        Message::Data(Data::Http(HttpData::Response(HttpResponse {
+                            status: http_response.status().into(),
+                            headers: http_response
+                                .headers()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                                .collect(),
+                            body: http_response.bytes().await?.to_vec(),
+                        })));
+
+                    protocol::write_message(&mut tunnel_server, &http_message).await?;
+                    debug!("Forwarded file to tunnel server");
+                }
+                Message::Data(Data::Http(HttpData::BodyChunk {
+                    stream_id,
+                    data,
+                    is_end,
+                })) => {
+                    let chunk = Message::http_chunk(stream_id, data, is_end);
+                    let Some(tx) = self.active_streams.get(&stream_id) else {
+                        debug!("Unexpected HTTP chunk with ID {stream_id}");
+                        continue;
+                    };
+                    tx.send(chunk).await?;
+                }
+                Message::StreamClose { stream_id } => {
+                    debug!("Closing stream {stream_id}");
+                    self.active_streams.remove(&stream_id);
+                }
                 _ => todo!(),
             };
         }
+    }
+
+    async fn handle_stream(
+        &self,
+        mut rx: Receiver<Message>,
+        tunnel_server: &mut TcpStream,
+    ) -> Result<()> {
+        let Some(message) = rx.recv().await else {
+            debug!("Stream channel has closed");
+            return Ok(());
+        };
+
+        let Message::Data(Data::Http(HttpData::Request(request))) = message else {
+            return Err(anyhow!("Expected an HTTP request"));
+        };
+
+        let http_client = reqwest::Client::new();
+        let file_server_url = format!(
+            "http://localhost:{}{}",
+            self.config.file_server_port, request.url
+        );
+        let reqwest = utils::to_reqwest(&http_client, request).await?;
+        let recv_stream = ReceiverStream::new(rx).map(|msg| match msg {
+            Message::Data(Data::Http(HttpData::BodyChunk {
+                stream_id,
+                data,
+                is_end,
+            })) => Ok(data),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Expected body chunk message",
+            )),
+        });
+        let response = http_client
+            .request(reqwest.method().clone(), file_server_url)
+            .body(Body::wrap_stream(recv_stream))
+            .send()
+            .await?;
+
+        let mut response_stream = response.bytes_stream();
+        let stream_open = Message::stream_open(ProtocolType::Http);
+        let Message::StreamOpen { stream_id, .. } = stream_open else {
+            return Err(anyhow!("Expected stream open"));
+        };
+        protocol::write_message(tunnel_server, &stream_open).await?;
+
+        while let Some(Ok(chunk)) = response_stream.next().await {
+            protocol::write_message(
+                tunnel_server,
+                &Message::http_chunk(stream_id, chunk.to_vec(), false),
+            )
+            .await?
+        }
+
+        protocol::write_message(tunnel_server, &Message::http_chunk(stream_id, vec![], true))
+            .await?;
 
         Ok(())
     }
