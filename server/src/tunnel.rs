@@ -226,16 +226,10 @@ impl Server {
                     else {
                         return Err(anyhow!("Expected HTTP request header"));
                     };
-
-                    let mut response_string = format!("HTTP/1.1 {}\r\n", status);
-
-                    for (key, value) in &headers {
-                        response_string.push_str(&format!("{}: {}\r\n", key, value));
-                    }
-                    response_string.push_str("\r\n");
+                    let response_string = utils::build_response_string(status, &headers)?;
 
                     downguard.write_all(response_string.as_bytes()).await?;
-                    debug!("Sent response header to downstream");
+                    debug!("Sent response header to downstream: {:?}", response_string);
 
                     let mut downwriter = TlsWriter::new(&mut downguard);
                     loop {
@@ -275,15 +269,7 @@ impl Server {
                         headers,
                         body,
                     } => {
-                        let mut response_string = format!("HTTP/1.1 {}\r\n", status);
-                        let is_chunked = headers
-                            .get("transfer-encoding")
-                            .map_or(false, |v| v.eq_ignore_ascii_case("chunked"));
-
-                        for (key, value) in &headers {
-                            response_string.push_str(&format!("{}: {}\r\n", key, value));
-                        }
-                        response_string.push_str("\r\n");
+                        let response_string = utils::build_response_string(status, &headers)?;
 
                         downguard.write_all(response_string.as_bytes()).await?;
                         debug!("Sent response header to downstream");
