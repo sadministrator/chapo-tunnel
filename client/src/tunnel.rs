@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use common::protocol::{self, Data, HttpData, HttpResponse, Message, ProtocolType};
+use common::protocol::{self, Data, HttpData, Message, ProtocolType};
 use dashmap::DashMap;
 use reqwest::Body;
 use tokio::{
@@ -73,7 +73,7 @@ impl Client {
             protocol::write_message(&mut tunnel_server, &request).await?;
             debug!("Handshake request sent");
 
-            let response: Message = protocol::read_message(&mut tunnel_server).await?;
+            let response = protocol::read_message(&mut tunnel_server).await?;
             debug!("Received handshake: {:?}", response);
 
             match response {
@@ -96,10 +96,10 @@ impl Client {
         }
 
         loop {
-            let data: Message = protocol::read_message(&mut tunnel_server).await?;
-            debug!("Received from tunnel server: {:?}", data);
+            let message = protocol::read_message(&mut tunnel_server).await?;
+            debug!("Received from tunnel server: {:?}", message);
 
-            match data {
+            match message {
                 Message::StreamOpen {
                     stream_id,
                     protocol,
@@ -110,19 +110,66 @@ impl Client {
 
                     self.handle_stream(rx, &mut tunnel_server).await?;
                 }
-                Message::Data(Data::Http(HttpData::Request(http_request))) => {
+                Message::Data(Data::Http(http_request)) => {
+                    let HttpData::Request {
+                        method,
+                        url,
+                        headers,
+                        body,
+                        version,
+                    } = http_request
+                    else {
+                        return Err(anyhow!("Expected HTTP request"));
+                    };
                     let http_client = reqwest::Client::new();
                     let http_response = http_client
                         .get(format!(
                             "http://localhost:{}{}",
-                            self.config.file_server_port, http_request.url
+                            self.config.file_server_port, url
                         ))
                         .send()
                         .await?;
                     debug!("Received from file server {:?}", http_response);
 
-                    let http_message =
-                        Message::Data(Data::Http(HttpData::Response(HttpResponse {
+                    let is_chunked = http_response
+                        .headers()
+                        .get("transfer-encoding")
+                        .map_or(false, |v| {
+                            v.to_str().is_ok_and(|s| s.eq_ignore_ascii_case("chunked"))
+                        });
+
+                    if is_chunked {
+                        let stream_open = Message::stream_open(ProtocolType::Http);
+                        let Message::StreamOpen { stream_id, .. } = stream_open else {
+                            return Err(anyhow!("Expected stream open"));
+                        };
+                        debug!("Opening stream {stream_id} with tunnel server");
+                        protocol::write_message(&mut tunnel_server, &stream_open).await?;
+
+                        debug!("Sending HTTP response header to tunnel server");
+                        let http_header = Message::Data(Data::Http(HttpData::Response {
+                            status: http_response.status().into(),
+                            headers: http_response
+                                .headers()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                                .collect(),
+                            body: vec![],
+                        }));
+                        protocol::write_message(&mut tunnel_server, &http_header).await?;
+
+                        debug!("Sending body in chunks");
+                        let mut body_stream = http_response.bytes_stream();
+                        while let Some(Ok(chunk)) = body_stream.next().await {
+                            let chunk_message =
+                                Message::http_chunk(stream_id, chunk.to_vec(), false);
+                            protocol::write_message(&mut tunnel_server, &chunk_message).await?;
+                        }
+
+                        let final_chunk = Message::http_chunk(stream_id, vec![], true);
+                        protocol::write_message(&mut tunnel_server, &final_chunk).await?;
+                    } else {
+                        let http_response = Message::Data(Data::Http(HttpData::Response {
                             status: http_response.status().into(),
                             headers: http_response
                                 .headers()
@@ -130,10 +177,11 @@ impl Client {
                                 .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
                                 .collect(),
                             body: http_response.bytes().await?.to_vec(),
-                        })));
+                        }));
 
-                    protocol::write_message(&mut tunnel_server, &http_message).await?;
-                    debug!("Forwarded file to tunnel server");
+                        protocol::write_message(&mut tunnel_server, &http_response).await?;
+                        debug!("Forwarded file to tunnel server via HTTP response");
+                    }
                 }
                 Message::Data(Data::Http(HttpData::BodyChunk {
                     stream_id,
@@ -166,16 +214,30 @@ impl Client {
             return Ok(());
         };
 
-        let Message::Data(Data::Http(HttpData::Request(request))) = message else {
+        let Message::Data(Data::Http(HttpData::Request {
+            method,
+            url,
+            headers,
+            body,
+            version,
+        })) = message
+        else {
             return Err(anyhow!("Expected an HTTP request"));
         };
 
         let http_client = reqwest::Client::new();
-        let file_server_url = format!(
-            "http://localhost:{}{}",
-            self.config.file_server_port, request.url
-        );
-        let reqwest = utils::to_reqwest(&http_client, request).await?;
+        let file_server_url = format!("http://localhost:{}{}", self.config.file_server_port, url);
+        let reqwest = utils::to_reqwest(
+            &http_client,
+            HttpData::Request {
+                method,
+                url,
+                headers,
+                body,
+                version,
+            },
+        )
+        .await?;
         let recv_stream = ReceiverStream::new(rx).map(|msg| match msg {
             Message::Data(Data::Http(HttpData::BodyChunk {
                 stream_id,

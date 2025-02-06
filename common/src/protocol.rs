@@ -117,10 +117,20 @@ pub enum Data {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum HttpData {
-    Request(HttpRequest),
-    Response(HttpResponse),
+    Request {
+        method: String,
+        url: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+        version: u8,
+    },
+    Response {
+        status: u16,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    },
     BodyChunk {
         stream_id: u32,
         data: Vec<u8>,
@@ -128,29 +138,45 @@ pub enum HttpData {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct HttpRequest {
-    pub method: String,
-    pub url: String,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-    pub version: u8,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-}
-
-impl fmt::Debug for HttpResponse {
+impl fmt::Debug for HttpData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpResponse")
-            .field("status", &self.status)
-            .field("headers", &self.headers)
-            .field("body", &format!("[{} bytes]", self.body.len()))
-            .finish()
+        match self {
+            HttpData::Request {
+                method,
+                url,
+                headers,
+                body,
+                version,
+            } => {
+                write!(
+                f,
+                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:2.?} kB, version: {:?} }}",
+                method, url, headers, body.len() as f32 / 1024.0, version
+            )
+            }
+            HttpData::Response {
+                status,
+                headers,
+                body,
+            } => write!(
+                f,
+                "Response {{ status: {:?}, headers: {:?}, body: {:2.?} kB }}",
+                status,
+                headers,
+                body.len() as f32 / 1024.0
+            ),
+            HttpData::BodyChunk {
+                stream_id,
+                data,
+                is_end,
+            } => write!(
+                f,
+                "BodyChunk {{ stream_id: {:?}, data: {:.2?} kB, is_end: {:?} }}",
+                stream_id,
+                data.len() as f32 / 1024.0,
+                is_end
+            ),
+        }
     }
 }
 

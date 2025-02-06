@@ -6,15 +6,14 @@ mod utils;
 use anyhow::Result;
 use args::Args;
 use clap::Parser;
-
 use file_server::FileServer;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .compact()
-        .finish();
+    let filter = EnvFilter::new("debug").add_directive("hyper=info".parse().unwrap());
+
+    let subscriber = fmt().with_env_filter(filter).compact().finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let args = Args::parse();

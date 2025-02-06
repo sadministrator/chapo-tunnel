@@ -1,11 +1,12 @@
 use std::{
+    collections::HashMap,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use anyhow::{anyhow, Result};
-use common::protocol::HttpRequest;
+use common::protocol::HttpData;
 use httparse;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufReader},
@@ -59,7 +60,7 @@ impl<'a> AsyncWrite for TlsWriter<'a> {
     }
 }
 
-pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
+pub fn parse_http_request(buf: &[u8]) -> Result<HttpData> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -81,7 +82,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
 
     let body = buf[header_length..].to_vec();
 
-    Ok(HttpRequest {
+    Ok(HttpData::Request {
         method,
         url: path,
         version,
@@ -97,9 +98,8 @@ pub fn request_is_complete(buf: &[u8]) -> Result<bool> {
     Ok(req.parse(buf)?.is_complete())
 }
 
-pub fn extract_subdomain(request: &HttpRequest) -> Result<String> {
-    let host = request
-        .headers
+pub fn extract_subdomain(headers: &HashMap<String, String>) -> Result<String> {
+    let host = headers
         .get("Host")
         .ok_or(anyhow!("Host missing from request"))?;
     let subdomain = host
