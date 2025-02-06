@@ -113,9 +113,6 @@ pub fn extract_subdomain(headers: &HashMap<String, String>) -> Result<String> {
 
 pub fn build_response_string(status: u16, headers: &HashMap<String, String>) -> Result<String> {
     let mut response_string = format!("HTTP/1.1 {}\r\n", status);
-    let is_chunked = headers
-        .get("transfer-encoding")
-        .map_or(false, |v| v.eq_ignore_ascii_case("chunked"));
 
     for (key, value) in headers {
         response_string.push_str(&format!("{}: {}\r\n", key, value));

@@ -2055,6 +2055,7 @@ dependencies = [
  "clap",
  "common",
  "dashmap",
+ "mime_guess",
  "reqwest",
  "tokio",
  "tokio-stream",

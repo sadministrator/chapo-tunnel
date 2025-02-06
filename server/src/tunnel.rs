@@ -15,7 +15,7 @@ use tokio_rustls::{
     rustls::{pki_types::PrivateKeyDer, ServerConfig},
     TlsAcceptor,
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::utils::{self, TlsWriter};
 
@@ -254,7 +254,7 @@ impl Server {
                                 break;
                             }
                             _ => {
-                                error!(
+                                warn!(
                                     "Received unexpected message from upstream: {:?}",
                                     stream_chunk
                                 );
@@ -269,26 +269,16 @@ impl Server {
                         headers,
                         body,
                     } => {
+                        debug!("{}", body.len());
                         let response_string = utils::build_response_string(status, &headers)?;
 
                         downguard.write_all(response_string.as_bytes()).await?;
-                        debug!("Sent response header to downstream");
+                        debug!("Forwarded response header to downstream");
 
                         let mut downwriter = TlsWriter::new(&mut downguard);
-
-                        if !body.is_empty() {
-                            if is_chunked {
-                                downwriter.write_chunk(&body).await?;
-                            } else {
-                                downwriter.write_all(&body).await?;
-                            }
-                        }
-
-                        if is_chunked {
-                            downwriter.write_final_chunk().await?;
-                        } else {
-                            downguard.flush().await?;
-                        }
+                        downwriter.write_chunk(&body).await?;
+                        downwriter.write_final_chunk().await?;
+                        debug!("Forwarded response body to downstream");
                     }
                     HttpData::Request {
                         method,
@@ -297,36 +287,33 @@ impl Server {
                         body,
                         version,
                     } => {
-                        error!("Received unexpected request from upstream client")
+                        warn!("Received unexpected request from upstream client")
                     }
                     HttpData::BodyChunk {
                         stream_id,
                         data,
                         is_end,
                     } => {
-                        error!("Received unexpected chunk from upstream {subdomain} with stream ID {stream_id}");
-
-                        let stream_close = Message::StreamClose { stream_id };
-                        protocol::write_message_locked(&mut upstream, &stream_close).await?;
+                        warn!("Received unexpected chunk from upstream {subdomain} with stream ID {stream_id}");
                     }
                 },
-                Message::Data(d) => error!(
+                Message::Data(d) => warn!(
                     "Received unexpected data of unexpected protocol type: {:?}",
                     d
                 ),
-                Message::StreamClose {
-                    stream_id: closed_id,
-                } => error!("Received unexpected stream close from upstream {subdomain}"),
+                Message::StreamClose { stream_id } => {
+                    warn!("Received unexpected stream close {stream_id} from upstream {subdomain}")
+                }
                 Message::HandshakeRequest {
                     supported_version,
                     supported_protocols,
                     auth_token,
-                } => error!("Received unexpected handshake request from upstream {subdomain}"),
+                } => warn!("Received unexpected handshake request from upstream {subdomain}"),
                 Message::HandshakeResponse {
                     accepted_version,
                     accepted_protocols,
                     subdomain,
-                } => error!("Received unexpected handshake response from upstream {subdomain}"),
+                } => warn!("Received unexpected handshake response from upstream {subdomain}"),
                 Message::Ping(v) => debug!("Received ping {v} from upstream {subdomain}"),
                 Message::Pong(v) => debug!("Received pong {v} from upstream {subdomain}"),
                 Message::Error(e) => error!("Message protocol error: {:?}", e),

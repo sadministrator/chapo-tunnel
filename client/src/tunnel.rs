@@ -140,75 +140,21 @@ impl Client {
                                     .await?;
                                 debug!("Received from file server {:?}", http_response);
 
-                                let is_chunked = http_response
-                                    .headers()
-                                    .get("transfer-encoding")
-                                    .map_or(false, |v| {
-                                        v.to_str().is_ok_and(|s| s.eq_ignore_ascii_case("chunked"))
-                                    });
+                                let http_response = Message::Data(Data::Http(HttpData::Response {
+                                    status: http_response.status().into(),
+                                    headers: http_response
+                                        .headers()
+                                        .into_iter()
+                                        .map(|(k, v)| {
+                                            (k.to_string(), v.to_str().unwrap().to_owned())
+                                        })
+                                        .collect(),
+                                    body: http_response.bytes().await?.to_vec(),
+                                }));
 
-                                if is_chunked {
-                                    let stream_open = Message::stream_open(ProtocolType::Http);
-                                    let Message::StreamOpen { stream_id, .. } = stream_open else {
-                                        return Err(anyhow!("Expected stream open"));
-                                    };
-                                    debug!("Opening stream {stream_id} with tunnel server");
-                                    protocol::write_message_locked(&tunnel_server, &stream_open)
-                                        .await?;
-
-                                    debug!("Sending HTTP response header to tunnel server");
-                                    let http_header =
-                                        Message::Data(Data::Http(HttpData::Response {
-                                            status: http_response.status().into(),
-                                            headers: http_response
-                                                .headers()
-                                                .into_iter()
-                                                .map(|(k, v)| {
-                                                    (k.to_string(), v.to_str().unwrap().to_owned())
-                                                })
-                                                .collect(),
-                                            body: vec![],
-                                        }));
-                                    protocol::write_message_locked(&tunnel_server, &http_header)
-                                        .await?;
-
-                                    debug!("Sending body in chunks");
-                                    let mut body_stream = http_response.bytes_stream();
-                                    while let Some(Ok(chunk)) = body_stream.next().await {
-                                        let chunk_message =
-                                            Message::http_chunk(stream_id, chunk.to_vec(), false);
-                                        protocol::write_message_locked(
-                                            &tunnel_server,
-                                            &chunk_message,
-                                        )
-                                        .await?;
-                                    }
-
-                                    let final_chunk = Message::http_chunk(stream_id, vec![], true);
-                                    protocol::write_message_locked(&tunnel_server, &final_chunk)
-                                        .await?;
-
-                                    let stream_close = Message::stream_close(stream_id);
-                                    protocol::write_message_locked(&tunnel_server, &stream_close)
-                                        .await?;
-                                } else {
-                                    let http_response =
-                                        Message::Data(Data::Http(HttpData::Response {
-                                            status: http_response.status().into(),
-                                            headers: http_response
-                                                .headers()
-                                                .into_iter()
-                                                .map(|(k, v)| {
-                                                    (k.to_string(), v.to_str().unwrap().to_owned())
-                                                })
-                                                .collect(),
-                                            body: http_response.bytes().await?.to_vec(),
-                                        }));
-
-                                    protocol::write_message_locked(&tunnel_server, &http_response)
-                                        .await?;
-                                    debug!("Forwarded file to tunnel server via HTTP response");
-                                }
+                                debug!("Forwarding response to tunnel server");
+                                protocol::write_message_locked(&tunnel_server, &http_response)
+                                    .await?;
                             }
                             HttpData::Response {
                                 status,
@@ -292,12 +238,14 @@ impl Client {
             .body(Body::wrap_stream(recv_stream))
             .send()
             .await?;
+        debug!("Received response from file server: {:?}", response);
 
         let mut response_stream = response.bytes_stream();
         let stream_open = Message::stream_open(ProtocolType::Http);
         let Message::StreamOpen { stream_id, .. } = stream_open else {
             return Err(anyhow!("Expected stream open"));
         };
+        debug!("Opening stream {stream_id} with tunnel server");
         protocol::write_message_locked(&tunnel_server, &stream_open).await?;
 
         while let Some(Ok(chunk)) = response_stream.next().await {
@@ -313,6 +261,7 @@ impl Client {
             &Message::http_chunk(stream_id, vec![], true),
         )
         .await?;
+        debug!("Finished streaming response body {stream_id}");
 
         Ok(())
     }

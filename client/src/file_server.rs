@@ -4,10 +4,12 @@ use anyhow::Result;
 use axum::{
     body::StreamBody,
     extract::State,
+    http::header,
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use mime_guess;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::{self, TraceLayer};
@@ -38,7 +40,16 @@ impl FileServer {
             Ok(file) => {
                 let stream = ReaderStream::new(file);
                 let body = StreamBody::new(stream);
-                Ok(Response::new(body))
+                let mime_type = mime_guess::from_path(&file_path)
+                    .first_or_octet_stream()
+                    .to_string();
+                let response = Response::builder()
+                    .header(header::CONTENT_TYPE, mime_type)
+                    .header(header::CONTENT_DISPOSITION, "inline")
+                    .body(body)
+                    .unwrap();
+
+                Ok(response)
             }
             Err(_) => Err(axum::http::StatusCode::NOT_FOUND),
         }
