@@ -44,6 +44,10 @@ impl Message {
         }
     }
 
+    pub fn stream_close(stream_id: u32) -> Self {
+        Self::StreamClose { stream_id }
+    }
+
     pub fn http_chunk(stream_id: u32, data: Vec<u8>, is_end: bool) -> Self {
         Self::Data(Data::Http(HttpData::BodyChunk {
             stream_id,
@@ -187,7 +191,11 @@ pub enum Error {
     ConnectionError(String),
 }
 
-pub async fn write_message<T: Serialize>(stream: &mut TcpStream, message: &T) -> Result<()> {
+pub async fn write_message<T, W>(stream: &mut W, message: &T) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
     let serialized = bincode::serialize(message)?;
     let length = serialized.len() as u32;
     stream.write_all(&length.to_be_bytes()).await?;
@@ -196,7 +204,11 @@ pub async fn write_message<T: Serialize>(stream: &mut TcpStream, message: &T) ->
     Ok(())
 }
 
-pub async fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
+pub async fn read_message<R, T>(stream: &mut R) -> Result<T>
+where
+    R: AsyncReadExt + Unpin,
+    T: DeserializeOwned,
+{
     let mut length_buf = [0u8; 4];
     stream.read_exact(&mut length_buf).await?;
     let length = u32::from_be_bytes(length_buf) as usize;
@@ -204,4 +216,17 @@ pub async fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> Result
     let mut message_buf = vec![0u8; length];
     stream.read_exact(&mut message_buf).await?;
     Ok(bincode::deserialize(&message_buf)?)
+}
+
+pub async fn write_message_locked<T: Serialize>(
+    stream: &Arc<Mutex<TcpStream>>,
+    message: &T,
+) -> Result<()> {
+    let mut guard = stream.lock().await;
+    write_message(&mut *guard, message).await
+}
+
+pub async fn read_message_locked<T: DeserializeOwned>(stream: &Arc<Mutex<TcpStream>>) -> Result<T> {
+    let mut guard = stream.lock().await;
+    read_message(&mut *guard).await
 }

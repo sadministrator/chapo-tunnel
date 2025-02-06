@@ -151,9 +151,9 @@ impl Server {
         let downstream_client = DownstreamClient::new(tls_reader);
 
         loop {
-            let mut downstream = downstream_client.stream.lock().await;
+            let mut downguard = downstream_client.stream.lock().await;
             let mut buf = vec![0u8; 1024];
-            let n = downstream.read(&mut buf).await?;
+            let n = downguard.read(&mut buf).await?;
             let request = utils::parse_http_request(&buf[..n])?;
             debug!("Received from downstream: {:?}", request);
 
@@ -165,7 +165,7 @@ impl Server {
             let upstream_client = upstream_clients
                 .get(&subdomain)
                 .ok_or(anyhow!("No upstream found for subdomain \"{subdomain}\""))?;
-            let mut upstream = upstream_client.stream.lock().await;
+            let mut upstream = upstream_client.stream.clone();
 
             let is_chunked = headers
                 .get("transfer-encoding")
@@ -177,7 +177,7 @@ impl Server {
             if !is_chunked || content_len.is_some_and(|len| len < STREAM_THRESHOLD) {
                 let message = Message::Data(Data::Http(request));
 
-                protocol::write_message(&mut upstream, &message).await?;
+                protocol::write_message_locked(&upstream, &message).await?;
                 debug!("Forwarded request upstream: {:?}", message);
             } else {
                 let tunnel = Tunnel {
@@ -190,11 +190,11 @@ impl Server {
                 };
                 tunnels.insert(stream_id, tunnel);
 
-                protocol::write_message(&mut upstream, &stream_open).await?;
+                protocol::write_message_locked(&mut upstream, &stream_open).await?;
 
                 loop {
                     let mut buf = [0u8; 1024];
-                    let n = downstream.read(&mut buf).await?;
+                    let n = downguard.read(&mut buf).await?;
                     let is_end = n == 0;
                     let chunk = Message::Data(Data::Http(HttpData::BodyChunk {
                         stream_id,
@@ -202,7 +202,7 @@ impl Server {
                         is_end,
                     }));
 
-                    protocol::write_message(&mut upstream, &chunk).await?;
+                    protocol::write_message_locked(&mut upstream, &chunk).await?;
 
                     if is_end {
                         break;
@@ -210,7 +210,7 @@ impl Server {
                 }
             }
 
-            let response = protocol::read_message(&mut upstream).await?;
+            let response = protocol::read_message_locked(&mut upstream).await?;
             debug!("Received from upstream: {:?}", response);
 
             match response {
@@ -219,7 +219,7 @@ impl Server {
                     protocol,
                 } => {
                     debug!("Upstream at {subdomain} opened stream {stream_id}");
-                    let request_header = protocol::read_message(&mut upstream).await?;
+                    let request_header = protocol::read_message_locked(&mut upstream).await?;
                     let Message::Data(Data::Http(HttpData::Response {
                         status, headers, ..
                     })) = request_header
@@ -234,12 +234,12 @@ impl Server {
                     }
                     response_string.push_str("\r\n");
 
-                    downstream.write_all(response_string.as_bytes()).await?;
+                    downguard.write_all(response_string.as_bytes()).await?;
                     debug!("Sent response header to downstream");
 
-                    let mut downwriter = TlsWriter::new(&mut downstream);
+                    let mut downwriter = TlsWriter::new(&mut downguard);
                     loop {
-                        let stream_chunk = protocol::read_message(&mut upstream).await?;
+                        let stream_chunk = protocol::read_message_locked(&mut upstream).await?;
                         trace!("{:?}", stream_chunk);
 
                         match stream_chunk {
@@ -285,10 +285,10 @@ impl Server {
                         }
                         response_string.push_str("\r\n");
 
-                        downstream.write_all(response_string.as_bytes()).await?;
+                        downguard.write_all(response_string.as_bytes()).await?;
                         debug!("Sent response header to downstream");
 
-                        let mut downwriter = TlsWriter::new(&mut downstream);
+                        let mut downwriter = TlsWriter::new(&mut downguard);
 
                         if !body.is_empty() {
                             if is_chunked {
@@ -301,7 +301,7 @@ impl Server {
                         if is_chunked {
                             downwriter.write_final_chunk().await?;
                         } else {
-                            downstream.flush().await?;
+                            downguard.flush().await?;
                         }
                     }
                     HttpData::Request {
@@ -321,7 +321,7 @@ impl Server {
                         error!("Received unexpected chunk from upstream {subdomain} with stream ID {stream_id}");
 
                         let stream_close = Message::StreamClose { stream_id };
-                        protocol::write_message(&mut upstream, &stream_close).await?;
+                        protocol::write_message_locked(&mut upstream, &stream_close).await?;
                     }
                 },
                 Message::Data(d) => error!(
