@@ -114,9 +114,17 @@ impl Server {
     }
 
     async fn listen_downstream_http(&self) -> Result<()> {
+        const HTTPS_LISTEN_ADDR: &str = "0.0.0.0:443";
         let tls_config = Arc::new(self.create_tls_config().await?);
         let acceptor = TlsAcceptor::from(tls_config);
-        let listener = TcpListener::bind("0.0.0.0:433").await?;
+        let listener = match TcpListener::bind(HTTPS_LISTEN_ADDR).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let err_msg = format!("Unable to bind to {HTTPS_LISTEN_ADDR}: {e}");
+                error!(err_msg);
+                return Err(anyhow!(err_msg));
+            }
+        };
         info!("Listening downstream for HTTPS");
 
         while let Ok((stream, addr)) = listener.accept().await {
