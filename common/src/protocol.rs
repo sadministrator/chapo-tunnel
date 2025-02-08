@@ -166,7 +166,7 @@ impl fmt::Debug for HttpData {
                 body,
             } => write!(
                 f,
-                "Response {{ status: {:?}, headers: {:?}, body: {:2.?} kB }}",
+                "Response {{ status: {:?}, headers: {:?}, body: {:.2?} kB }}",
                 status,
                 headers,
                 body.len() as f32 / 1024.0
@@ -188,9 +188,10 @@ impl fmt::Debug for HttpData {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Error {
-    HandshakeError(String),
-    ProtocolError(String),
-    ConnectionError(String),
+    Handshake(String),
+    Protocol(String),
+    Connection(String),
+    Stream(u32),
 }
 
 pub async fn write_message<T, W>(stream: &mut W, message: &T) -> Result<()>
