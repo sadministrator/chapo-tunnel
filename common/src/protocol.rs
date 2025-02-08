@@ -156,7 +156,7 @@ impl fmt::Debug for HttpData {
             } => {
                 write!(
                 f,
-                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:2.?} kB, version: {:?} }}",
+                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:2?} kB, version: {:?} }}",
                 method, url, headers, body.len() as f32 / 1024.0, version
             )
             }
@@ -166,7 +166,7 @@ impl fmt::Debug for HttpData {
                 body,
             } => write!(
                 f,
-                "Response {{ status: {:?}, headers: {:?}, body: {:2.?} kB }}",
+                "Response {{ status: {:?}, headers: {:?}, body: {:2?} kB }}",
                 status,
                 headers,
                 body.len() as f32 / 1024.0
