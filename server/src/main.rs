@@ -8,12 +8,14 @@ use anyhow::Result;
 use args::Args;
 use clap::Parser;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 use tunnel::{Config, Server};
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(EnvFilter::from_default_env())
         .compact()
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();

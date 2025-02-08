@@ -15,6 +15,8 @@ use tokio_util::io::ReaderStream;
 use tower_http::trace::{self, TraceLayer};
 use tracing::{info, Level};
 
+use crate::utils;
+
 pub struct FileServer {
     path: PathBuf,
     pub port: u16,
@@ -30,7 +32,8 @@ impl FileServer {
         uri: axum::http::Uri,
     ) -> impl IntoResponse {
         let path = uri.path().trim_start_matches('/');
-        let file_path = root_path.join(path);
+        let decoded_path = utils::decode_url(path);
+        let file_path = root_path.join(decoded_path);
 
         if !file_path.starts_with(&root_path) {
             return Err(axum::http::StatusCode::FORBIDDEN);

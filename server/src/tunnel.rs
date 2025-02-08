@@ -3,6 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use anyhow::{anyhow, Result};
 use common::protocol::{
     self, Data, DownstreamClient, HttpData, Message, ProtocolType, Tunnel, UpstreamClient,
+    STREAM_THRESHOLD,
 };
 use dashmap::DashMap;
 use rustls_pemfile::{self, certs};
@@ -12,7 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{
-    rustls::{pki_types::PrivateKeyDer, ServerConfig},
+    rustls::{pki_types::PrivateKeyDer, server::ServerConfig},
     TlsAcceptor,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -120,9 +121,9 @@ impl Server {
         let listener = match TcpListener::bind(HTTPS_LISTEN_ADDR).await {
             Ok(listener) => listener,
             Err(e) => {
-                let err_msg = format!("Unable to bind to {HTTPS_LISTEN_ADDR}: {e}");
-                error!(err_msg);
-                return Err(anyhow!(err_msg));
+                let err = format!("Unable to bind to {HTTPS_LISTEN_ADDR}: {e}");
+                error!("{err}");
+                return Err(anyhow!("{err}"));
             }
         };
         info!("Listening downstream for HTTPS");
@@ -152,8 +153,6 @@ impl Server {
         upstream_clients: DashMap<String, UpstreamClient>,
         tunnels: DashMap<u32, Tunnel>,
     ) -> Result<()> {
-        const STREAM_THRESHOLD: usize = 1024;
-
         let tls_stream = acceptor.accept(downstream).await?;
         let tls_reader = BufReader::new(tls_stream);
         let downstream_client = DownstreamClient::new(tls_reader);
@@ -226,13 +225,17 @@ impl Server {
                     stream_id,
                     protocol,
                 } => {
-                    debug!("Upstream at {subdomain} opened stream {stream_id}");
                     let request_header = protocol::read_message_locked(&mut upstream).await?;
+                    debug!(
+                        "Received response header in {stream_id}: {:?}",
+                        request_header
+                    );
+
                     let Message::Data(Data::Http(HttpData::Response {
                         status, headers, ..
                     })) = request_header
                     else {
-                        return Err(anyhow!("Expected HTTP request header"));
+                        return Err(anyhow!("Expected HTTP request header in {stream_id}"));
                     };
                     let response_string = utils::build_response_string(status, &headers)?;
 
@@ -277,11 +280,11 @@ impl Server {
                         headers,
                         body,
                     } => {
-                        debug!("{}", body.len());
                         let response_string = utils::build_response_string(status, &headers)?;
 
                         downguard.write_all(response_string.as_bytes()).await?;
                         debug!("Forwarded response header to downstream");
+                        trace!("{response_string}");
 
                         let mut downwriter = TlsWriter::new(&mut downguard);
                         downwriter.write_chunk(&body).await?;
@@ -302,7 +305,8 @@ impl Server {
                         data,
                         is_end,
                     } => {
-                        warn!("Received unexpected chunk from upstream {subdomain} with stream ID {stream_id}");
+                        let is_end_string = if is_end { "last " } else { "" };
+                        warn!("Received unexpected {is_end_string}chunk from upstream {subdomain} with stream ID {stream_id}");
                     }
                 },
                 Message::Data(d) => warn!(

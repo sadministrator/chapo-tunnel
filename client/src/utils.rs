@@ -40,3 +40,26 @@ pub async fn to_reqwest(client: &reqwest::Client, request: HttpData) -> Result<r
         .body(body)
         .build()?)
 }
+
+pub fn decode_url(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let (Some(c1), Some(c2)) = (chars.next(), chars.next()) {
+                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", c1, c2), 16) {
+                    if let Some(decoded_char) = char::from_u32(byte as u32) {
+                        output.push(decoded_char);
+                        continue;
+                    }
+                }
+            }
+            output.push('%');
+        } else {
+            output.push(c);
+        }
+    }
+
+    output
+}

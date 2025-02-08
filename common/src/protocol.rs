@@ -11,6 +11,8 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 
+pub const STREAM_THRESHOLD: usize = 1024;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     HandshakeRequest {
