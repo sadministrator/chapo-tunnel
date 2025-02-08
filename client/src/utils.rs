@@ -63,3 +63,25 @@ pub fn decode_url(input: &str) -> String {
 
     output
 }
+
+pub fn is_video_request(headers: &std::collections::HashMap<String, String>, url: &str) -> bool {
+    headers.get("Accept").map_or(false, |accept| {
+        accept.contains("video/")
+            || url.ends_with(".mp4")
+            || url.ends_with(".webm")
+            || url.ends_with(".mov")
+    }) || headers
+        .get("Sec-Fetch-Dest")
+        .map_or(false, |dest| dest == "video")
+}
+
+pub fn add_video_headers(
+    mut headers: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    headers.insert("Accept-Ranges".to_string(), "bytes".to_string());
+    headers.insert(
+        "Cache-Control".to_string(),
+        "public, max-age=31536000".to_string(),
+    );
+    headers
+}

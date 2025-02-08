@@ -12,7 +12,7 @@ use tokio::{
     },
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::utils::{self};
 
@@ -59,6 +59,8 @@ impl Client {
     }
 
     pub async fn run(self) -> Result<()> {
+        const CHANNEL_BUF_SIZE: usize = 8192;
+
         let tunnel_server = TcpStream::connect(format!(
             "{}:{}",
             self.config.remote_host, self.config.remote_port
@@ -75,12 +77,12 @@ impl Client {
 
         loop {
             protocol::write_message_locked(&tunnel_server, &request).await?;
-            debug!("Handshake request sent");
+            debug!("Handshake request sent: {:?}", request);
 
-            let response = protocol::read_message_locked(&tunnel_server).await?;
-            debug!("Received handshake: {:?}", response);
+            let hs_response = protocol::read_message_locked(&tunnel_server).await?;
+            debug!("Received handshake: {:?}", hs_response);
 
-            match response {
+            match hs_response {
                 Message::HandshakeResponse {
                     accepted_version,
                     accepted_protocols,
@@ -92,7 +94,7 @@ impl Client {
                 _ => {
                     debug!(
                         "Received unexpected message from tunnel server: {:?}",
-                        response
+                        hs_response
                     );
                     tokio::time::sleep(Duration::new(1, 0)).await;
                 }
@@ -109,62 +111,47 @@ impl Client {
                     protocol,
                 } => {
                     debug!("Stream opened by tunnel server with ID {stream_id}");
-                    let (tx, rx) = mpsc::channel(32);
+                    let (tx, rx) = mpsc::channel(CHANNEL_BUF_SIZE);
                     self.active_streams.insert(stream_id, tx);
 
                     let tunnel_server = tunnel_server.clone();
-                    let _ = tokio::spawn(Self::handle_up_stream(
+                    let _ = tokio::spawn(Self::handle_stream(
                         rx,
                         tunnel_server,
                         self.config.file_server_port,
+                        stream_id,
                     ))
                     .await?;
                 }
                 Message::Data(data) => {
                     match data {
                         Data::Http(http_data) => match http_data {
-                            HttpData::Request { url, .. } => {
+                            HttpData::Request { headers, url, .. } => {
                                 let http_client = reqwest::Client::new();
-                                let response = http_client
+                                let force_stream = utils::is_video_request(&headers, &url);
+
+                                let fs_response = http_client
                                     .get(format!(
                                         "http://localhost:{}{}",
                                         self.config.file_server_port, url
                                     ))
                                     .send()
                                     .await?;
-                                debug!("Received from file server {:?}", response);
+                                debug!("Received from file server {:?}", fs_response);
 
-                                let is_chunked = response
+                                let is_chunked = fs_response
                                     .headers()
                                     .get("transfer-encoding")
                                     .map_or(false, |v| v.to_str().unwrap() == "chunked");
-                                let content_len = response
+                                let content_len = fs_response
                                     .headers()
                                     .get("content-length")
                                     .and_then(|v| v.to_str().unwrap().parse::<usize>().ok());
-                                if !is_chunked
-                                    || content_len.is_some_and(|len| len < STREAM_THRESHOLD)
-                                {
-                                    let response_message =
-                                        Message::Data(Data::Http(HttpData::Response {
-                                            status: response.status().into(),
-                                            headers: response
-                                                .headers()
-                                                .into_iter()
-                                                .map(|(k, v)| {
-                                                    (k.to_string(), v.to_str().unwrap().to_owned())
-                                                })
-                                                .collect(),
-                                            body: response.bytes().await?.to_vec(),
-                                        }));
 
-                                    debug!("Forwarding response to tunnel server");
-                                    protocol::write_message_locked(
-                                        &tunnel_server,
-                                        &response_message,
-                                    )
-                                    .await?;
-                                } else {
+                                if force_stream
+                                    || is_chunked
+                                    || content_len.is_some_and(|len| len > STREAM_THRESHOLD)
+                                {
                                     let tunnel_server = tunnel_server.clone();
                                     let _ = tokio::spawn(async move {
                                         let stream_open = Message::stream_open(ProtocolType::Http);
@@ -181,8 +168,8 @@ impl Client {
 
                                         let response_header =
                                             Message::Data(Data::Http(HttpData::Response {
-                                                status: response.status().into(),
-                                                headers: response
+                                                status: fs_response.status().into(),
+                                                headers: utils::add_video_headers(fs_response
                                                     .headers()
                                                     .into_iter()
                                                     .map(|(k, v)| {
@@ -191,7 +178,7 @@ impl Client {
                                                             v.to_str().unwrap().to_owned(),
                                                         )
                                                     })
-                                                    .collect(),
+                                                    .collect()),
                                                 body: vec![],
                                             }));
                                         debug!(
@@ -205,17 +192,24 @@ impl Client {
                                         .await?;
 
                                         trace!("Sending response body chunks to tunnel server via {stream_id}");
-                                        let mut response_stream = response.bytes_stream();
-                                        while let Some(Ok(chunk)) = response_stream.next().await {
-                                            protocol::write_message_locked(
-                                                &tunnel_server,
-                                                &Message::http_chunk(
-                                                    stream_id,
-                                                    chunk.to_vec(),
-                                                    false,
-                                                ),
-                                            )
-                                            .await?
+                                        let mut response_stream = fs_response.bytes_stream();
+                                        while let Some(chunk_result) = response_stream.next().await {
+                                            match chunk_result {
+                                                Ok(chunk) => {
+                                                    if let Err(e) = protocol::write_message_locked(
+                                                        &tunnel_server,
+                                                        &Message::http_chunk(stream_id, chunk.to_vec(), false),
+                                                    ).await
+                                                    {
+                                                        error!("Failed to write chunk: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Stream error: {}", e);
+                                                    break;
+                                                }
+                                            }
                                         }
 
                                         protocol::write_message_locked(
@@ -235,13 +229,28 @@ impl Client {
                                         Ok(())
                                     })
                                     .await?;
+                                } else {
+                                    let response_message =
+                                        Message::Data(Data::Http(HttpData::Response {
+                                            status: fs_response.status().into(),
+                                            headers: fs_response
+                                                .headers()
+                                                .into_iter()
+                                                .map(|(k, v)| {
+                                                    (k.to_string(), v.to_str().unwrap().to_owned())
+                                                })
+                                                .collect(),
+                                            body: fs_response.bytes().await?.to_vec(),
+                                        }));
+
+                                    debug!("Forwarding response to tunnel server");
+                                    protocol::write_message_locked(
+                                        &tunnel_server,
+                                        &response_message,
+                                    )
+                                    .await?;
                                 }
                             }
-                            HttpData::Response {
-                                status,
-                                headers,
-                                body,
-                            } => todo!(),
                             HttpData::BodyChunk {
                                 stream_id,
                                 data,
@@ -254,100 +263,154 @@ impl Client {
                                 };
                                 tx.send(chunk).await?;
                             }
+                            HttpData::Response {
+                                status,
+                                headers,
+                                body,
+                            } => warn!("Received unexpected response from tunnel server"),
                         },
                         _ => todo!(),
                     };
                 }
                 Message::StreamClose { stream_id } => {
-                    self.active_streams
-                        .remove(&stream_id)
-                        .map(|(id, _)| debug!("Closed stream {id}"));
+                    if let Some((id, tx)) = self.active_streams.remove(&stream_id) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        debug!("Closed stream {id}");
+                    }
                 }
+                Message::Error(e) => match e {
+                    protocol::Error::Stream(stream_id) => {
+                        self.active_streams
+                            .remove(&stream_id)
+                            .map(|(id, _)| error!("Removed stream {id}"));
+                    }
+                    _ => todo!(),
+                },
                 _ => todo!(),
             };
         }
     }
 
-    async fn handle_up_stream(
+    async fn handle_stream(
         mut rx: Receiver<Message>,
         tunnel_server: Arc<Mutex<TcpStream>>,
         file_server_port: u16,
+        stream_id: u32,
     ) -> Result<()> {
-        debug!("Handling up stream");
-        let Some(message) = rx.recv().await else {
-            debug!("Stream channel has closed");
-            return Ok(());
-        };
+        let result = async {
+            debug!("Handling up stream");
+            let Some(message) = rx.recv().await else {
+                debug!("Stream channel has closed");
+                return Ok(());
+            };
 
-        let Message::Data(Data::Http(HttpData::Request {
-            method,
-            url,
-            headers,
-            body,
-            version,
-        })) = message
-        else {
-            return Err(anyhow!("Expected an HTTP request"));
-        };
-
-        let http_client = reqwest::Client::new();
-        let file_server_url = format!("http://localhost:{}{}", file_server_port, url);
-        let reqwest = utils::to_reqwest(
-            &http_client,
-            HttpData::Request {
+            let Message::Data(Data::Http(HttpData::Request {
                 method,
                 url,
                 headers,
                 body,
                 version,
-            },
-        )
-        .await?;
-        let recv_stream = ReceiverStream::new(rx).map(|msg| match msg {
-            Message::Data(Data::Http(HttpData::BodyChunk {
-                stream_id,
-                data,
-                is_end,
-            })) => Ok(data),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Expected body chunk message",
-            )),
-        });
-        let response = http_client
-            .request(reqwest.method().clone(), file_server_url)
-            .body(Body::wrap_stream(recv_stream))
-            .send()
+            })) = message
+            else {
+                return Err(anyhow!("Expected an HTTP request"));
+            };
+
+            let http_client = reqwest::Client::new();
+            let file_server_url = format!("http://localhost:{}{}", file_server_port, url);
+            let reqwest = utils::to_reqwest(
+                &http_client,
+                HttpData::Request {
+                    method,
+                    url,
+                    headers,
+                    body,
+                    version,
+                },
+            )
             .await?;
-        debug!("Received response from file server: {:?}", response);
+            let recv_stream = ReceiverStream::new(rx).map(|msg| match msg {
+                Message::Data(Data::Http(HttpData::BodyChunk { data, .. })) => Ok(data),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected body chunk message",
+                )),
+            });
+            let fs_response = http_client
+                .request(reqwest.method().clone(), file_server_url)
+                .body(Body::wrap_stream(recv_stream))
+                .send()
+                .await?;
+            debug!("Received response from file server: {:?}", fs_response);
 
-        let mut response_stream = response.bytes_stream();
-        let stream_open = Message::stream_open(ProtocolType::Http);
-        let Message::StreamOpen { stream_id, .. } = stream_open else {
-            return Err(anyhow!("Expected stream open"));
-        };
-        debug!("Opening stream {stream_id} with tunnel server");
-        protocol::write_message_locked(&tunnel_server, &stream_open).await?;
+            let response_header = HttpData::Response {
+                status: fs_response.status().into(),
+                headers: utils::add_video_headers(
+                    fs_response
+                        .headers()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                        .collect(),
+                ),
+                body: vec![],
+            };
 
-        while let Some(Ok(chunk)) = response_stream.next().await {
+            debug!(
+                "Forwarding response header to tunnel server: {:?}",
+                response_header
+            );
+            protocol::write_message_locked(&tunnel_server, &response_header).await?;
+
+            let mut response_stream = fs_response.bytes_stream();
+            let stream_open = Message::stream_open(ProtocolType::Http);
+            let Message::StreamOpen { stream_id, .. } = stream_open else {
+                return Err(anyhow!("Expected stream open"));
+            };
+            debug!("Opening stream {stream_id} with tunnel server");
+            protocol::write_message_locked(&tunnel_server, &stream_open).await?;
+
+            while let Some(chunk_result) = response_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        if let Err(e) = protocol::write_message_locked(
+                            &tunnel_server,
+                            &Message::http_chunk(stream_id, chunk.to_vec(), false),
+                        )
+                        .await
+                        {
+                            error!("Failed to write chunk: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Stream error: {}", e);
+                        break;
+                    }
+                }
+            }
+
             protocol::write_message_locked(
                 &tunnel_server,
-                &Message::http_chunk(stream_id, chunk.to_vec(), false),
+                &Message::http_chunk(stream_id, vec![], true),
             )
-            .await?
+            .await?;
+
+            debug!("Closing stream {stream_id}");
+            let stream_close = Message::stream_close(stream_id);
+            protocol::write_message_locked(&tunnel_server, &stream_close).await?;
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = &result {
+            error!("Stream error: {}", e);
+            let _ = protocol::write_message_locked(
+                &tunnel_server,
+                &Message::Error(protocol::Error::Stream(stream_id)),
+            )
+            .await;
         }
 
-        protocol::write_message_locked(
-            &tunnel_server,
-            &Message::http_chunk(stream_id, vec![], true),
-        )
-        .await?;
-        debug!("Finished streaming response body {stream_id}");
-
-        Ok(())
-    }
-
-    async fn handle_down_stream() -> Result<()> {
-        todo!("refactor this logic out of other functions")
+        result
     }
 }
