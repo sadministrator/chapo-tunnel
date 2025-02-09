@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let args = Args::parse();
-    let version = "0.1.0".to_owned(); // todo: grab value from Cargo.toml
+    let version = 10; // todo: grab value from Cargo.toml
     let config = tunnel::Config::new(
         args.file_server_port,
         args.remote_host,

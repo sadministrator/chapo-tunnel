@@ -16,12 +16,12 @@ pub const STREAM_THRESHOLD: usize = 1024;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     HandshakeRequest {
-        supported_version: String,
+        supported_version: u32,
         supported_protocols: Vec<ProtocolType>,
         auth_token: Option<String>,
     },
     HandshakeResponse {
-        accepted_version: String,
+        accepted_version: u32,
         accepted_protocols: Vec<ProtocolType>,
         subdomain: String,
     },
@@ -66,11 +66,8 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    pub fn new(stream: TcpStream, protocols: Vec<ProtocolType>) -> Self {
-        Self {
-            stream: Arc::new(Mutex::new(stream)),
-            protocols,
-        }
+    pub fn new(stream: Arc<Mutex<TcpStream>>, protocols: Vec<ProtocolType>) -> Self {
+        Self { stream, protocols }
     }
 }
 

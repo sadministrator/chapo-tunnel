@@ -21,7 +21,7 @@ pub struct Config {
     remote_host: String,
     remote_port: u16,
     supported_protocols: Vec<ProtocolType>,
-    supported_version: String,
+    supported_version: u32,
     auth_token: Option<String>,
 }
 
@@ -31,7 +31,7 @@ impl Config {
         remote_host: String,
         remote_port: u16,
         supported_protocols: Vec<ProtocolType>,
-        supported_version: String,
+        supported_version: u32,
         auth_token: Option<String>,
     ) -> Self {
         Self {
@@ -115,13 +115,16 @@ impl Client {
                     self.active_streams.insert(stream_id, tx);
 
                     let tunnel_server = tunnel_server.clone();
-                    let _ = tokio::spawn(Self::handle_stream(
+                    if let Err(e) = tokio::spawn(Self::handle_stream(
                         rx,
                         tunnel_server,
                         self.config.file_server_port,
                         stream_id,
                     ))
-                    .await?;
+                    .await?
+                    {
+                        error!("Error handling stream: {e}");
+                    };
                 }
                 Message::Data(data) => {
                     match data {
@@ -153,7 +156,7 @@ impl Client {
                                     || content_len.is_some_and(|len| len > STREAM_THRESHOLD)
                                 {
                                     let tunnel_server = tunnel_server.clone();
-                                    let _ = tokio::spawn(async move {
+                                    if let Err(e) = tokio::spawn(async move {
                                         let stream_open = Message::stream_open(ProtocolType::Http);
                                         let Message::StreamOpen { stream_id, .. } = stream_open
                                         else {
@@ -228,7 +231,9 @@ impl Client {
 
                                         Ok(())
                                     })
-                                    .await?;
+                                    .await? {
+                                        error!("Error handling streaming request: {e}");
+                                    };
                                 } else {
                                     let response_message =
                                         Message::Data(Data::Http(HttpData::Response {
