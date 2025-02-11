@@ -9,22 +9,28 @@ use anyhow::{anyhow, Result};
 use common::protocol::HttpData;
 use httparse;
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncWrite, AsyncWriteExt, BufStream},
     net::TcpStream,
 };
 use tokio_rustls::server::TlsStream;
 
 pub struct TlsWriter<'a> {
-    inner: &'a mut BufReader<TlsStream<TcpStream>>,
+    inner: &'a mut BufStream<TlsStream<TcpStream>>,
 }
 
 impl<'a> TlsWriter<'a> {
-    pub fn new(inner: &'a mut BufReader<TlsStream<TcpStream>>) -> Self {
+    pub fn new(inner: &'a mut BufStream<TlsStream<TcpStream>>) -> Self {
         Self { inner }
     }
 }
 
 impl<'a> TlsWriter<'a> {
+    pub async fn write_simple_response(&mut self, response: &str) -> Result<()> {
+        self.write_all(response.as_bytes()).await?;
+        self.flush().await?;
+        Ok(())
+    }
+
     pub async fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
         if !data.is_empty() {
             let size_line = format!("{:x}\r\n", data.len());
@@ -111,13 +117,18 @@ pub fn extract_subdomain(headers: &HashMap<String, String>) -> Result<String> {
     Ok(subdomain)
 }
 
-pub fn build_response_string(status: u16, headers: &HashMap<String, String>) -> Result<String> {
+pub fn build_response_string(
+    status: u16,
+    headers: &HashMap<String, String>,
+    body: Vec<u8>,
+) -> Result<String> {
     let mut response_string = format!("HTTP/1.1 {}\r\n", status);
 
     for (key, value) in headers {
         response_string.push_str(&format!("{}: {}\r\n", key, value));
     }
     response_string.push_str("\r\n");
+    response_string.push_str(&String::from_utf8(body)?);
 
     Ok(response_string)
 }

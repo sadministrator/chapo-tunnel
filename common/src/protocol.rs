@@ -3,15 +3,15 @@ use std::{collections::HashMap, fmt, sync::Arc};
 use anyhow::Result;
 use clap::ValueEnum;
 use rand::Rng;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::TcpStream,
     sync::Mutex,
 };
 use tokio_rustls::server::TlsStream;
 
-pub const STREAM_THRESHOLD: usize = 1024;
+pub const STREAMING_THRESHOLD: usize = 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
@@ -73,13 +73,13 @@ impl UpstreamClient {
 
 #[derive(Clone, Debug)]
 pub struct DownstreamClient {
-    pub stream: Arc<Mutex<BufReader<TlsStream<TcpStream>>>>,
+    pub stream: Arc<Mutex<BufStream<TlsStream<TcpStream>>>>,
 }
 
 impl DownstreamClient {
-    pub fn new(tls_reader: BufReader<TlsStream<TcpStream>>) -> Self {
+    pub fn new(tls_reader: TlsStream<TcpStream>) -> Self {
         Self {
-            stream: Arc::new(Mutex::new(tls_reader)),
+            stream: Arc::new(Mutex::new(BufStream::new(tls_reader))),
         }
     }
 }
@@ -191,10 +191,9 @@ pub enum Error {
     Stream(u32),
 }
 
-pub async fn write_message<T, W>(stream: &mut W, message: &T) -> Result<()>
+pub async fn write_message<W>(stream: &mut W, message: &Message) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
-    T: Serialize,
 {
     let serialized = bincode::serialize(message)?;
     let length = serialized.len() as u32;
@@ -204,10 +203,9 @@ where
     Ok(())
 }
 
-pub async fn read_message<R, T>(stream: &mut R) -> Result<T>
+pub async fn read_message<R>(stream: &mut R) -> Result<Message>
 where
     R: AsyncReadExt + Unpin,
-    T: DeserializeOwned,
 {
     let mut length_buf = [0u8; 4];
     stream.read_exact(&mut length_buf).await?;
@@ -218,15 +216,12 @@ where
     Ok(bincode::deserialize(&message_buf)?)
 }
 
-pub async fn write_message_locked<T: Serialize>(
-    stream: &Arc<Mutex<TcpStream>>,
-    message: &T,
-) -> Result<()> {
+pub async fn write_message_locked(stream: &Arc<Mutex<TcpStream>>, message: &Message) -> Result<()> {
     let mut guard = stream.lock().await;
     write_message(&mut *guard, message).await
 }
 
-pub async fn read_message_locked<T: DeserializeOwned>(stream: &Arc<Mutex<TcpStream>>) -> Result<T> {
+pub async fn read_message_locked(stream: &Arc<Mutex<TcpStream>>) -> Result<Message> {
     let mut guard = stream.lock().await;
     read_message(&mut *guard).await
 }

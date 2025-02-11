@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
-use common::protocol::{self, Data, HttpData, Message, ProtocolType, STREAM_THRESHOLD};
+use common::protocol::{self, Data, HttpData, Message, ProtocolType, STREAMING_THRESHOLD};
 use dashmap::DashMap;
 use reqwest::Body;
 use tokio::{
@@ -153,7 +153,7 @@ impl Client {
 
                                 if force_stream
                                     || is_chunked
-                                    || content_len.is_some_and(|len| len > STREAM_THRESHOLD)
+                                    || content_len.is_some_and(|len| len > STREAMING_THRESHOLD)
                                 {
                                     let tunnel_server = tunnel_server.clone();
                                     if let Err(e) = tokio::spawn(async move {
@@ -347,7 +347,7 @@ impl Client {
                 .await?;
             debug!("Received response from file server: {:?}", fs_response);
 
-            let response_header = HttpData::Response {
+            let response_header = Message::Data(Data::Http(HttpData::Response {
                 status: fs_response.status().into(),
                 headers: utils::add_video_headers(
                     fs_response
@@ -357,7 +357,7 @@ impl Client {
                         .collect(),
                 ),
                 body: vec![],
-            };
+            }));
 
             debug!(
                 "Forwarding response header to tunnel server: {:?}",
