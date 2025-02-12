@@ -74,14 +74,3 @@ pub fn is_video_request(headers: &std::collections::HashMap<String, String>, url
         .get("Sec-Fetch-Dest")
         .map_or(false, |dest| dest == "video")
 }
-
-pub fn add_video_headers(
-    mut headers: std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
-    headers.insert("Accept-Ranges".to_string(), "bytes".to_string());
-    headers.insert(
-        "Cache-Control".to_string(),
-        "public, max-age=31536000".to_string(),
-    );
-    headers
-}

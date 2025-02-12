@@ -172,7 +172,7 @@ impl Client {
                                         let response_header =
                                             Message::Data(Data::Http(HttpData::Response {
                                                 status: fs_response.status().into(),
-                                                headers: utils::add_video_headers(fs_response
+                                                headers:fs_response
                                                     .headers()
                                                     .into_iter()
                                                     .map(|(k, v)| {
@@ -181,7 +181,7 @@ impl Client {
                                                             v.to_str().unwrap().to_owned(),
                                                         )
                                                     })
-                                                    .collect()),
+                                                    .collect(),
                                                 body: vec![],
                                             }));
                                         debug!(
@@ -272,7 +272,7 @@ impl Client {
                                 status,
                                 headers,
                                 body,
-                            } => warn!("Received unexpected response from tunnel server"),
+                            } => warn!("Received unexpected HTTP response from tunnel server"),
                         },
                         _ => todo!(),
                     };
@@ -349,13 +349,12 @@ impl Client {
 
             let response_header = Message::Data(Data::Http(HttpData::Response {
                 status: fs_response.status().into(),
-                headers: utils::add_video_headers(
-                    fs_response
-                        .headers()
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
-                        .collect(),
-                ),
+                headers: fs_response
+                    .headers()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                    .collect(),
+
                 body: vec![],
             }));
 
