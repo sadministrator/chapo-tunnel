@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use common::protocol::{
-    self, Data, DownstreamClient, HttpData, Message, ProtocolType, Tunnel, UpstreamClient,
+    self, Data, DownstreamClient, Error, HttpData, Message, ProtocolType, Tunnel, UpstreamClient,
     STREAMING_THRESHOLD,
 };
 use dashmap::DashMap;
@@ -65,9 +65,16 @@ impl Server {
         let upstream = self.clone();
         let downstream = self.clone();
 
-        let upstream_handle = tokio::spawn(async move { upstream.listen_upstream().await }); // 1
-        let downstream_handle =
-            tokio::spawn(async move { downstream.listen_downstream_http().await });
+        let upstream_handle = tokio::spawn(async move {
+            if let Err(e) = upstream.listen_upstream().await {
+                error!("Listen upstream failed: {e}");
+            }
+        });
+        let downstream_handle = tokio::spawn(async move {
+            if let Err(e) = downstream.listen_downstream_http().await {
+                error!("Listen downstream HTTP failed: {e}");
+            }
+        });
 
         let _ = tokio::join!(upstream_handle, downstream_handle);
 
@@ -166,11 +173,9 @@ impl Server {
                 .await?,
         );
         let acceptor = TlsAcceptor::from(tls_config);
-        let listener = TcpListener::bind(&https_bind_addr).await.map_err(|e| {
-            let err = format!("Unable to bind to {https_bind_addr}: {e}");
-            error!("{err}");
-            anyhow!("{err}")
-        })?;
+        let listener = TcpListener::bind(&https_bind_addr)
+            .await
+            .map_err(|e| anyhow!("Unable to bind to {https_bind_addr}: {e}"))?;
 
         info!("Listening downstream for HTTPS");
         Ok((listener, acceptor))
@@ -184,7 +189,7 @@ impl Server {
             if let Err(e) =
                 Self::handle_connection(stream, acceptor, upstream_clients, tunnels).await
             {
-                error!("HTTPS connection error: {e}");
+                error!("HTTPS connection died: {e}");
             }
         });
     }
@@ -211,18 +216,27 @@ impl Server {
         loop {
             let request = Self::read_http_request(downstream.clone()).await?;
             let HttpData::Request { headers, .. } = &request else {
-                return Err(anyhow!("Expected HTTP request"));
+                return Err(anyhow!("Expected infallible HTTP request"));
             };
-            let (subdomain, upstream_client) =
-                Self::get_upstream_client(&request, &upstream_clients).await?;
+            let upstream_client = Self::get_upstream_client(&request, &upstream_clients).await?;
 
             if Self::should_use_streaming(&headers) {
-                tokio::spawn(Self::handle_streaming_request(
-                    request,
-                    downstream_client.clone(),
-                    upstream_client.clone(),
-                    tunnels.clone(),
-                ));
+                let downstream_client = downstream_client.clone();
+                let upstream_client = upstream_client.clone();
+                let tunnels = tunnels.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = Self::handle_streaming_request(
+                        request,
+                        downstream_client.clone(),
+                        upstream_client.clone(),
+                        tunnels.clone(),
+                    )
+                    .await
+                    {
+                        error!("Failed handling streaming request: {e}")
+                    };
+                });
             } else {
                 Self::handle_simple_request(
                     &request,
@@ -232,14 +246,6 @@ impl Server {
                 )
                 .await?;
             }
-
-            Self::process_upstream_response(
-                downstream_client.clone(),
-                upstream_client.clone(),
-                &subdomain,
-                &tunnels,
-            )
-            .await?;
         }
     }
 
@@ -257,7 +263,7 @@ impl Server {
     async fn get_upstream_client(
         request: &HttpData,
         upstream_clients: &DashMap<String, UpstreamClient>,
-    ) -> Result<(String, UpstreamClient)> {
+    ) -> Result<UpstreamClient> {
         let HttpData::Request { headers, .. } = request else {
             return Err(anyhow!("Expected a HTTP request"));
         };
@@ -277,7 +283,7 @@ impl Server {
             .ok_or_else(|| anyhow!("No upstream client found for subdomain: {}", subdomain))?
             .clone();
 
-        Ok((subdomain, client))
+        Ok(client)
     }
 
     fn should_use_streaming(headers: &HashMap<String, String>) -> bool {
@@ -309,6 +315,7 @@ impl Server {
 
         let stream_open = Message::stream_open(ProtocolType::Http);
 
+        debug!("Opening stream {stream_id} with upstream client");
         protocol::write_message_locked(&upstream_client.stream, &stream_open).await?;
         protocol::write_message_locked(
             &upstream_client.stream,
@@ -351,15 +358,13 @@ impl Server {
     ) -> Result<()> {
         let message = Message::Data(Data::Http(request.clone()));
 
-        debug!("Forwarding request upstream: {:?}", message);
+        debug!("Forwarding simple request upstream: {:?}", message);
         protocol::write_message_locked(&upstream_client.stream, &message).await?;
 
         let response_message = protocol::read_message_locked(&upstream_client.stream).await?;
         match response_message {
-            Message::StreamOpen {
-                stream_id,
-                protocol,
-            } => {
+            Message::StreamOpen { stream_id, .. } => {
+                debug!("Received stream open {stream_id}");
                 Self::handle_streaming_response(
                     downstream_client.clone(),
                     upstream_client.clone(),
@@ -380,62 +385,13 @@ impl Server {
         Ok(())
     }
 
-    async fn process_upstream_response(
-        downstream_client: DownstreamClient,
-        upstream_client: UpstreamClient,
-        subdomain: &str,
-        tunnels: &DashMap<u32, Tunnel>,
-    ) -> Result<()> {
-        let response = protocol::read_message_locked(&upstream_client.stream).await?;
-
-        match response {
-            Message::StreamOpen {
-                stream_id,
-                protocol,
-            } => {
-                tunnels.insert(
-                    stream_id,
-                    Tunnel {
-                        upstream: upstream_client.clone(),
-                        downstream: downstream_client.clone(),
-                    },
-                );
-
-                debug!("Spawned handle streaming response");
-                if let Err(e) = tokio::spawn(Self::handle_streaming_response(
-                    downstream_client,
-                    upstream_client,
-                    tunnels.clone(),
-                    stream_id,
-                ))
-                .await?
-                {
-                    error!("Error handling streaming response: {e}");
-                }
-                debug!("Got past if");
-            }
-            Message::Data(Data::Http(response)) => {
-                Self::handle_simple_response(response, downstream_client).await?;
-            }
-            message => {
-                return Err(anyhow!(
-                    "Unexpected message type from upstream client with domain `{}`: {:?}",
-                    subdomain,
-                    message
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
     async fn handle_streaming_response(
         downstream_client: DownstreamClient,
         upstream_client: UpstreamClient,
         tunnels: DashMap<u32, Tunnel>,
         stream_id: u32,
     ) -> Result<()> {
-        let upstream = upstream_client.stream;
+        let upstream = upstream_client.stream.clone();
         let response_header = protocol::read_message_locked(&upstream).await?;
         debug!(
             "Received response header in {stream_id}: {:?}",
@@ -451,7 +407,7 @@ impl Server {
         let response_string = utils::build_response_string(status, &headers, vec![])?;
 
         let mut downguard = downstream_client.stream.lock().await;
-        let mut downwriter: TlsWriter<'_> = TlsWriter::new(&mut downguard);
+        let mut downwriter = TlsWriter::new(&mut downguard);
 
         downwriter.write_simple_response(&response_string).await?;
         debug!(
@@ -469,16 +425,36 @@ impl Server {
                     data,
                     is_end,
                 })) => {
-                    downwriter.write_chunk(&data).await?;
-
                     if is_end {
                         trace!("Writing final chunk to stream {stream_id}");
                         downwriter.write_final_chunk().await?;
                     }
+
+                    if let Err(e) = downwriter.write_chunk(&data).await {
+                        debug!("Downstream client disconnected while streaming {stream_id}: {e}");
+
+                        tunnels
+                            .remove(&stream_id)
+                            .map(|(id, _)| debug!("Removed stream {id}"));
+
+                        protocol::write_message_locked(
+                            &upstream_client.stream,
+                            &Message::Error(Error::Stream(stream_id)),
+                        )
+                        .await?;
+
+                        return Ok(());
+                    }
                 }
                 Message::StreamClose { stream_id } => {
                     debug!("Upstream closed stream {stream_id}");
-                    tunnels.remove(&stream_id);
+                    downwriter
+                        .shutdown()
+                        .await
+                        .map(|_| trace!("Closed TLS stream in tunnel {stream_id}"))?;
+                    tunnels
+                        .remove(&stream_id)
+                        .map(|(id, _)| trace!("Cleaned up stream {id}"));
                     break;
                 }
                 _ => {
@@ -504,7 +480,10 @@ impl Server {
             body,
         } = response
         else {
-            return Err(anyhow!("Expected simple HTTP response"));
+            return Err(anyhow!(
+                "Expected simple HTTP response, received: {:?}",
+                response
+            ));
         };
         let response_string = utils::build_response_string(status, &headers, body)?;
 

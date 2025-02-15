@@ -153,7 +153,7 @@ impl fmt::Debug for HttpData {
             } => {
                 write!(
                 f,
-                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:2.?} kB, version: {:?} }}",
+                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:.3?} kB, version: {:?} }}",
                 method, url, headers, body.len() as f32 / 1024.0, version
             )
             }
@@ -163,7 +163,7 @@ impl fmt::Debug for HttpData {
                 body,
             } => write!(
                 f,
-                "Response {{ status: {:?}, headers: {:?}, body: {:.2?} kB }}",
+                "Response {{ status: {:?}, headers: {:?}, body: {:.3?} kB }}",
                 status,
                 headers,
                 body.len() as f32 / 1024.0
@@ -174,7 +174,7 @@ impl fmt::Debug for HttpData {
                 is_end,
             } => write!(
                 f,
-                "BodyChunk {{ stream_id: {:?}, data: {:.2?} kB, is_end: {:?} }}",
+                "BodyChunk {{ stream_id: {:?}, data: {:.3?} kB, is_end: {:?} }}",
                 stream_id,
                 data.len() as f32 / 1024.0,
                 is_end

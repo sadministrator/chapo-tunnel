@@ -13,6 +13,7 @@ use tokio::{
     net::TcpStream,
 };
 use tokio_rustls::server::TlsStream;
+use tracing::trace;
 
 pub struct TlsWriter<'a> {
     inner: &'a mut BufStream<TlsStream<TcpStream>>,
@@ -45,6 +46,28 @@ impl<'a> TlsWriter<'a> {
         self.write_all(b"0\r\n\r\n").await?;
         self.flush().await?;
         Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        trace!("Starting TLS shutdown sequence");
+
+        self.flush().await?;
+        let tls_stream = self.inner.get_mut();
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), tls_stream.shutdown()).await {
+            Ok(Ok(_)) => {
+                trace!("TLS shutdown completed successfully");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                trace!("TLS shutdown failed: {}", e);
+                Err(anyhow!("TLS shutdown failed: {}", e))
+            }
+            Err(_) => {
+                trace!("TLS shutdown timed out");
+                Err(anyhow!("TLS shutdown timed out"))
+            }
+        }
     }
 }
 
