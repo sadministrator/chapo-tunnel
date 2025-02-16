@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use common::protocol::HttpData;
+use common::protocol::{BodyReader, HttpRequest};
 use httparse;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufStream},
@@ -26,8 +26,8 @@ impl<'a> TlsWriter<'a> {
 }
 
 impl<'a> TlsWriter<'a> {
-    pub async fn write_simple_response(&mut self, response: &str) -> Result<()> {
-        self.write_all(response.as_bytes()).await?;
+    pub async fn write_simple_response(&mut self, response: &[u8]) -> Result<()> {
+        self.write_all(response).await?;
         self.flush().await?;
         Ok(())
     }
@@ -89,16 +89,15 @@ impl<'a> AsyncWrite for TlsWriter<'a> {
     }
 }
 
-pub fn parse_http_request(buf: &[u8]) -> Result<HttpData> {
+pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
 
-    let header_length = req.parse(buf)?.unwrap();
     let method = req.method.unwrap_or_default().to_owned();
     let path = req.path.unwrap_or_default().to_owned();
     let version = req.version.unwrap_or_default();
 
-    let headers = req
+    let headers: HashMap<String, String> = req
         .headers
         .iter()
         .map(|h| {
@@ -109,14 +108,24 @@ pub fn parse_http_request(buf: &[u8]) -> Result<HttpData> {
         })
         .collect();
 
-    let body = buf[header_length..].to_vec();
+    let body_reader = if let Some(encoding) = headers.get("transfer-encoding") {
+        if encoding == "chunked" {
+            BodyReader::Chunked
+        } else {
+            BodyReader::Fixed(0)
+        }
+    } else if let Some(length) = headers.get("content-length") {
+        BodyReader::Fixed(length.parse()?)
+    } else {
+        BodyReader::Fixed(0)
+    };
 
-    Ok(HttpData::Request {
+    Ok(HttpRequest {
         method,
         url: path,
         version,
         headers,
-        body,
+        body_reader,
     })
 }
 
@@ -127,31 +136,17 @@ pub fn request_is_complete(buf: &[u8]) -> Result<bool> {
     Ok(req.parse(buf)?.is_complete())
 }
 
-pub fn extract_subdomain(headers: &HashMap<String, String>) -> Result<String> {
-    let host = headers
-        .get("Host")
-        .ok_or(anyhow!("Host missing from request"))?;
-    let subdomain = host
-        .split('.')
-        .next()
-        .ok_or(anyhow!("Subdomain missing from request"))?
-        .to_owned();
+pub fn build_response(status: u16, headers: &HashMap<String, String>, body: Vec<u8>) -> Vec<u8> {
+    let mut response = Vec::new();
 
-    Ok(subdomain)
-}
-
-pub fn build_response_string(
-    status: u16,
-    headers: &HashMap<String, String>,
-    body: Vec<u8>,
-) -> Result<String> {
-    let mut response_string = format!("HTTP/1.1 {}\r\n", status);
+    response.extend_from_slice(format!("HTTP/1.1 {}\r\n", status).as_bytes());
 
     for (key, value) in headers {
-        response_string.push_str(&format!("{}: {}\r\n", key, value));
+        response.extend_from_slice(format!("{}: {}\r\n", key, value).as_bytes());
     }
-    response_string.push_str("\r\n");
-    response_string.push_str(&String::from_utf8(body)?);
 
-    Ok(response_string)
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(&body);
+
+    response
 }

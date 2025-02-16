@@ -5,8 +5,8 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use common::protocol::{
-    self, Data, DownstreamClient, Error, HttpData, Message, ProtocolType, Tunnel, UpstreamClient,
-    STREAMING_THRESHOLD,
+    self, BodyReader, Data, DownstreamClient, Error, HttpData, HttpRequest, Message, ProtocolType,
+    Tunnel, UpstreamClient, STREAMING_THRESHOLD,
 };
 use dashmap::DashMap;
 use tokio::{
@@ -215,43 +215,47 @@ impl Server {
 
         loop {
             let request = Self::read_http_request(downstream.clone()).await?;
-            let HttpData::Request { headers, .. } = &request else {
-                return Err(anyhow!("Expected infallible HTTP request"));
-            };
             let upstream_client = Self::get_upstream_client(&request, &upstream_clients).await?;
 
-            if Self::should_use_streaming(&headers) {
-                let downstream_client = downstream_client.clone();
-                let upstream_client = upstream_client.clone();
-                let tunnels = tunnels.clone();
+            match request.body_reader {
+                BodyReader::Chunked => {
+                    let downstream_client = downstream_client.clone();
+                    let upstream_client = upstream_client.clone();
+                    let tunnels = tunnels.clone();
 
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_streaming_request(
-                        request,
-                        downstream_client.clone(),
-                        upstream_client.clone(),
-                        tunnels.clone(),
-                    )
-                    .await
-                    {
-                        error!("Failed handling streaming request: {e}")
-                    };
-                });
-            } else {
-                Self::handle_simple_request(
-                    &request,
-                    upstream_client.clone(),
-                    downstream_client.clone(),
-                    tunnels.clone(),
-                )
-                .await?;
-            }
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_chunked_request(
+                            request,
+                            downstream_client.clone(),
+                            upstream_client.clone(),
+                            tunnels.clone(),
+                        )
+                        .await
+                        {
+                            error!("Failed handling chunked request: {e}")
+                        };
+                    });
+                }
+                BodyReader::Fixed(length) => {
+                    if length > STREAMING_THRESHOLD {
+                        todo!("Stream body non-chunked");
+                    } else {
+                        Self::handle_simple_request(
+                            &request,
+                            upstream_client.clone(),
+                            downstream_client.clone(),
+                            tunnels.clone(),
+                        )
+                        .await?;
+                    }
+                }
+            };
         }
     }
 
     async fn read_http_request(
         stream: Arc<Mutex<BufStream<TlsStream<TcpStream>>>>,
-    ) -> Result<HttpData> {
+    ) -> Result<HttpRequest> {
         let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
         let n = stream.lock().await.read(&mut buf).await?;
         let request = utils::parse_http_request(&buf[..n])?;
@@ -261,14 +265,11 @@ impl Server {
     }
 
     async fn get_upstream_client(
-        request: &HttpData,
+        request: &HttpRequest,
         upstream_clients: &DashMap<String, UpstreamClient>,
     ) -> Result<UpstreamClient> {
-        let HttpData::Request { headers, .. } = request else {
-            return Err(anyhow!("Expected a HTTP request"));
-        };
-
-        let host = headers
+        let host = request
+            .headers
             .get("Host")
             .ok_or_else(|| anyhow!("No Host header found"))?;
 
@@ -300,8 +301,8 @@ impl Server {
         false
     }
 
-    async fn handle_streaming_request(
-        request: HttpData,
+    async fn handle_chunked_request(
+        request: HttpRequest,
         downstream_client: DownstreamClient,
         upstream_client: UpstreamClient,
         tunnels: DashMap<u32, Tunnel>,
@@ -319,12 +320,11 @@ impl Server {
         protocol::write_message_locked(&upstream_client.stream, &stream_open).await?;
         protocol::write_message_locked(
             &upstream_client.stream,
-            &Message::Data(Data::Http(request)),
+            &Message::Data(Data::Http(HttpData::Request(request))),
         )
         .await?;
 
         // todo: actually send chunks in a loop
-        // probably need to refactor HTTP request parsing and HttpRequest struct to include a BodyReader enum to implement this
 
         let response = protocol::read_message_locked(&upstream_client.stream).await?;
 
@@ -351,12 +351,12 @@ impl Server {
     }
 
     async fn handle_simple_request(
-        request: &HttpData,
+        request: &HttpRequest,
         upstream_client: UpstreamClient,
         downstream_client: DownstreamClient,
         tunnels: DashMap<u32, Tunnel>,
     ) -> Result<()> {
-        let message = Message::Data(Data::Http(request.clone()));
+        let message = Message::Data(Data::Http(HttpData::Request(request.clone())));
 
         debug!("Forwarding simple request upstream: {:?}", message);
         protocol::write_message_locked(&upstream_client.stream, &message).await?;
@@ -404,16 +404,13 @@ impl Server {
         else {
             return Err(anyhow!("Expected HTTP request header in {stream_id}"));
         };
-        let response_string = utils::build_response_string(status, &headers, vec![])?;
+        let response_bytes = utils::build_response(status, &headers, vec![]);
 
         let mut downguard = downstream_client.stream.lock().await;
         let mut downwriter = TlsWriter::new(&mut downguard);
 
-        downwriter.write_simple_response(&response_string).await?;
-        debug!(
-            "Sent streaming response header to downstream: {:?}",
-            response_string
-        );
+        downwriter.write_simple_response(&response_bytes).await?;
+        debug!("Sent streaming response header to downstream");
 
         loop {
             let stream_chunk = protocol::read_message_locked(&upstream).await?;
@@ -474,6 +471,7 @@ impl Server {
         response: HttpData,
         downstream_client: DownstreamClient,
     ) -> Result<()> {
+        debug!("{:?}", response);
         let HttpData::Response {
             status,
             headers,
@@ -485,15 +483,12 @@ impl Server {
                 response
             ));
         };
-        let response_string = utils::build_response_string(status, &headers, body)?;
+        let response_bytes = utils::build_response(status, &headers, body);
 
         let mut downguard = downstream_client.stream.lock().await;
         let mut downwriter = TlsWriter::new(&mut downguard);
-        downwriter.write_simple_response(&response_string).await?;
-        debug!(
-            "Sent simple response header to downstream: {:?}",
-            response_string
-        );
+        downwriter.write_simple_response(&response_bytes).await?;
+        debug!("Sent simple response header to downstream",);
 
         Ok(())
     }

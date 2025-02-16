@@ -1,7 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
-use common::protocol::{self, Data, HttpData, Message, ProtocolType, STREAMING_THRESHOLD};
+use common::protocol::{
+    self, Data, HttpData, HttpRequest, Message, ProtocolType, STREAMING_THRESHOLD,
+};
 use dashmap::DashMap;
 use reqwest::Body;
 use tokio::{
@@ -129,7 +131,7 @@ impl Client {
                 Message::Data(data) => {
                     match data {
                         Data::Http(http_data) => match http_data {
-                            HttpData::Request { headers, url, .. } => {
+                            HttpData::Request(HttpRequest { headers, url, .. }) => {
                                 let http_client = reqwest::Client::new();
                                 let force_stream = utils::is_video_request(&headers, &url);
 
@@ -309,30 +311,14 @@ impl Client {
                 return Ok(());
             };
 
-            let Message::Data(Data::Http(HttpData::Request {
-                method,
-                url,
-                headers,
-                body,
-                version,
-            })) = message
-            else {
+            let Message::Data(Data::Http(HttpData::Request(http_request))) = message else {
                 return Err(anyhow!("Expected an HTTP request"));
             };
 
             let http_client = reqwest::Client::new();
-            let file_server_url = format!("http://localhost:{}{}", file_server_port, url);
-            let reqwest = utils::to_reqwest(
-                &http_client,
-                HttpData::Request {
-                    method,
-                    url,
-                    headers,
-                    body,
-                    version,
-                },
-            )
-            .await?;
+            let file_server_url =
+                format!("http://localhost:{}{}", file_server_port, http_request.url);
+            let reqwest = utils::to_reqwest_header(&http_client, http_request).await?;
             let recv_stream = ReceiverStream::new(rx).map(|msg| match msg {
                 Message::Data(Data::Http(HttpData::BodyChunk { data, .. })) => Ok(data),
                 _ => Err(std::io::Error::new(

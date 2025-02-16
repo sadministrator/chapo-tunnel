@@ -43,21 +43,30 @@ impl FileServer {
             .to_string();
 
         if !file_path.starts_with(&root_path) {
-            return Err(axum::http::StatusCode::FORBIDDEN);
+            return Err(StatusCode::FORBIDDEN);
         }
 
         match File::open(&file_path).await {
             Ok(mut file) => {
-                let file_size = file.metadata().await.unwrap().len();
+                let file_size = file
+                    .metadata()
+                    .await
+                    .map_err(|_| StatusCode::NOT_FOUND)?
+                    .len();
                 let range = if let Some(range) = headers.get(header::RANGE) {
-                    Self::parse_range_header(range.to_str().unwrap_or_default(), file_size)
+                    Self::parse_range_header(
+                        range.to_str().map_err(|_| StatusCode::BAD_REQUEST)?,
+                        file_size,
+                    )
                 } else {
                     None
                 };
 
                 match range {
                     Some((start, end)) => {
-                        file.seek(SeekFrom::Start(start)).await.unwrap();
+                        file.seek(SeekFrom::Start(start))
+                            .await
+                            .map_err(|_| StatusCode::BAD_REQUEST)?;
                         let content_length = end - start + 1;
 
                         let limited_reader = file.take(content_length);
@@ -75,7 +84,7 @@ impl FileServer {
                             .header(header::ACCEPT_RANGES, "bytes")
                             .header(header::CONTENT_DISPOSITION, "inline")
                             .body(body)
-                            .unwrap();
+                            .map_err(|_| StatusCode::BAD_REQUEST)?;
 
                         Ok(response)
                     }
@@ -91,7 +100,7 @@ impl FileServer {
                             .header(header::ACCEPT_RANGES, "bytes")
                             .header(header::CONTENT_DISPOSITION, "inline")
                             .body(body)
-                            .unwrap();
+                            .map_err(|_| StatusCode::BAD_REQUEST)?;
 
                         Ok(response)
                     }

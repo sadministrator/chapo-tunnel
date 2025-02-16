@@ -5,13 +5,13 @@ use clap::ValueEnum;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream},
     net::TcpStream,
     sync::Mutex,
 };
 use tokio_rustls::server::TlsStream;
 
-pub const STREAMING_THRESHOLD: usize = 1024;
+pub const STREAMING_THRESHOLD: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
@@ -122,13 +122,7 @@ pub enum Data {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum HttpData {
-    Request {
-        method: String,
-        url: String,
-        headers: HashMap<String, String>,
-        body: Vec<u8>,
-        version: u8,
-    },
+    Request(HttpRequest),
     Response {
         status: u16,
         headers: HashMap<String, String>,
@@ -141,20 +135,35 @@ pub enum HttpData {
     },
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub enum BodyReader {
+    Fixed(usize),
+    Chunked,
+}
+
+impl fmt::Debug for BodyReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BodyReader::Fixed(size) => write!(f, "Fixed({size})"),
+            BodyReader::Chunked => write!(f, "Chunked"),
+        }
+    }
+}
+
 impl fmt::Debug for HttpData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HttpData::Request {
+            HttpData::Request(HttpRequest {
                 method,
                 url,
-                headers,
-                body,
                 version,
-            } => {
+                headers,
+                body_reader,
+            }) => {
                 write!(
                 f,
-                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:.3?} kB, version: {:?} }}",
-                method, url, headers, body.len() as f32 / 1024.0, version
+                "Request {{ method: {:?}, url: {:?}, headers: {:?}, body: {:?}, version: {:?} }}",
+                method, url, headers, body_reader, version
             )
             }
             HttpData::Response {
@@ -163,10 +172,10 @@ impl fmt::Debug for HttpData {
                 body,
             } => write!(
                 f,
-                "Response {{ status: {:?}, headers: {:?}, body: {:.3?} kB }}",
+                "Response {{ status: {:?}, headers: {:?}, body: {} B }}",
                 status,
                 headers,
-                body.len() as f32 / 1024.0
+                body.len()
             ),
             HttpData::BodyChunk {
                 stream_id,
@@ -174,13 +183,60 @@ impl fmt::Debug for HttpData {
                 is_end,
             } => write!(
                 f,
-                "BodyChunk {{ stream_id: {:?}, data: {:.3?} kB, is_end: {:?} }}",
+                "BodyChunk {{ stream_id: {:?}, data: {:?} B, is_end: {:?} }}",
                 stream_id,
-                data.len() as f32 / 1024.0,
+                data.len(),
                 is_end
             ),
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub version: u8,
+    pub headers: HashMap<String, String>,
+    pub body_reader: BodyReader,
+}
+
+impl HttpRequest {
+    pub async fn bytes(&mut self, stream: &mut BufStream<TlsStream<TcpStream>>) -> Result<Vec<u8>> {
+        match &self.body_reader {
+            BodyReader::Fixed(len) => {
+                let mut body = vec![0u8; *len];
+                stream.read_exact(&mut body).await?;
+                Ok(body)
+            }
+            BodyReader::Chunked => {
+                let mut body = vec![];
+                loop {
+                    let mut size_line = String::new();
+                    stream.read_line(&mut size_line).await?;
+
+                    let size = usize::from_str_radix(size_line.trim(), 16)?;
+                    if size == 0 {
+                        let mut buf = [0u8; 2];
+                        stream.read_exact(&mut buf).await?;
+                        break;
+                    }
+
+                    let mut chunk = vec![0u8; size];
+                    stream.read_exact(&mut chunk).await?;
+                    body.extend_from_slice(&chunk);
+
+                    let mut buf = [0u8; 2];
+                    stream.read_exact(&mut buf).await?;
+                }
+                Ok(body)
+            }
+        }
+    }
+
+    // pub fn bytes_stream(&mut self) -> impl Stream<Item = Result<Vec<u8>>> {
+    //     todo!()
+    // }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

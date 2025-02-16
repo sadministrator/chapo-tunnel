@@ -1,23 +1,16 @@
-use anyhow::{anyhow, Result};
-use common::protocol::HttpData;
+use anyhow::Result;
+use common::protocol::HttpRequest;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Method, Version,
 };
 
-pub async fn to_reqwest(client: &reqwest::Client, request: HttpData) -> Result<reqwest::Request> {
-    let HttpData::Request {
-        method,
-        url,
-        headers,
-        body,
-        version,
-    } = request
-    else {
-        return Err(anyhow!("Expected an HTTP request"));
-    };
-    let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    let version = match version {
+pub async fn to_reqwest_header(
+    client: &reqwest::Client,
+    request: HttpRequest,
+) -> Result<reqwest::Request> {
+    let method = Method::from_bytes(request.method.as_bytes()).unwrap_or(Method::GET);
+    let version = match request.version {
         0 => Version::HTTP_10,
         1 => Version::HTTP_11,
         2 => Version::HTTP_2,
@@ -25,19 +18,18 @@ pub async fn to_reqwest(client: &reqwest::Client, request: HttpData) -> Result<r
         _ => Version::HTTP_11,
     };
 
-    let mut header_map = HeaderMap::new();
-    for (key, value) in headers {
-        header_map.insert(
+    let mut headers = HeaderMap::new();
+    for (key, value) in request.headers {
+        headers.insert(
             HeaderName::from_bytes(key.as_bytes())?,
             HeaderValue::from_bytes(value.as_bytes())?,
         );
     }
 
     Ok(client
-        .request(method, url)
+        .request(method, request.url)
         .version(version)
-        .headers(header_map)
-        .body(body)
+        .headers(headers)
         .build()?)
 }
 
