@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::new("debug").add_directive("hyper=info".parse().unwrap());
+    let filter = EnvFilter::from_default_env().add_directive("hyper=info".parse().unwrap());
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .compact()

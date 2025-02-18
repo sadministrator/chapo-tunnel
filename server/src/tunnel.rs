@@ -10,7 +10,7 @@ use common::protocol::{
 };
 use dashmap::DashMap;
 use tokio::{
-    io::{AsyncReadExt, BufStream},
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -287,20 +287,6 @@ impl Server {
         Ok(client)
     }
 
-    fn should_use_streaming(headers: &HashMap<String, String>) -> bool {
-        if let Some(content_length) = headers.get("Content-Length") {
-            if let Ok(length) = content_length.parse::<usize>() {
-                return length > STREAMING_THRESHOLD;
-            }
-        }
-
-        if let Some(transfer_encoding) = headers.get("Transfer-Encoding") {
-            return transfer_encoding.to_lowercase().contains("chunked");
-        }
-
-        false
-    }
-
     async fn handle_chunked_request(
         request: HttpRequest,
         downstream_client: DownstreamClient,
@@ -324,7 +310,7 @@ impl Server {
         )
         .await?;
 
-        // todo: actually send chunks in a loop
+        // todo: actually send chunks in a loop, requires implementing HttpRequest::stream_body()
 
         let response = protocol::read_message_locked(&upstream_client.stream).await?;
 
@@ -404,6 +390,7 @@ impl Server {
         else {
             return Err(anyhow!("Expected HTTP request header in {stream_id}"));
         };
+        let is_chunked = utils::is_chunked(&headers);
         let response_bytes = utils::build_response(status, &headers, vec![]);
 
         let mut downguard = downstream_client.stream.lock().await;
@@ -422,25 +409,39 @@ impl Server {
                     data,
                     is_end,
                 })) => {
-                    if is_end {
-                        trace!("Writing final chunk to stream {stream_id}");
-                        downwriter.write_final_chunk().await?;
-                    }
+                    if is_chunked {
+                        if is_end {
+                            trace!("Writing final chunk to stream {stream_id}");
+                            downwriter.write_final_chunk().await?;
+                        }
 
-                    if let Err(e) = downwriter.write_chunk(&data).await {
-                        debug!("Downstream client disconnected while streaming {stream_id}: {e}");
+                        if let Err(e) = downwriter.write_chunk(&data).await {
+                            debug!(
+                                "Downstream client disconnected while streaming {stream_id}: {e}"
+                            );
 
-                        tunnels
-                            .remove(&stream_id)
-                            .map(|(id, _)| debug!("Removed stream {id}"));
+                            tunnels
+                                .remove(&stream_id)
+                                .map(|(id, _)| debug!("Removed stream {id}"));
 
-                        protocol::write_message_locked(
-                            &upstream_client.stream,
-                            &Message::Error(Error::Stream(stream_id)),
-                        )
-                        .await?;
+                            protocol::write_message_locked(
+                                &upstream_client.stream,
+                                &Message::Error(Error::Stream(stream_id)),
+                            )
+                            .await?;
 
-                        return Ok(());
+                            return Ok(());
+                        }
+                    } else {
+                        if is_end {
+                            trace!("Writing final bytes to stream {stream_id}");
+                            downwriter.flush().await?;
+
+                            return Ok(());
+                        }
+
+                        debug!("not chunked, writing {} bytes", data.len());
+                        downwriter.write(&data).await?;
                     }
                 }
                 Message::StreamClose { stream_id } => {

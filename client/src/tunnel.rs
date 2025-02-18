@@ -186,10 +186,8 @@ impl Client {
                                                     .collect(),
                                                 body: vec![],
                                             }));
-                                        debug!(
-                                            "Sending response header to tunnel server via {stream_id}"
-                                        );
-                                        trace!("{:?}", response_header);
+
+                                        debug!("Sending response header to tunnel server via {stream_id}: {:?}", response_header);
                                         protocol::write_message_locked(
                                             &tunnel_server,
                                             &response_header,
@@ -250,7 +248,7 @@ impl Client {
                                             body: fs_response.bytes().await?.to_vec(),
                                         }));
 
-                                    debug!("Forwarding response to tunnel server");
+                                    debug!("Forwarding simple response to tunnel server");
                                     protocol::write_message_locked(
                                         &tunnel_server,
                                         &response_message,

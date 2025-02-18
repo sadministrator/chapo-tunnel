@@ -93,6 +93,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
 
+    let _header_length = req.parse(buf)?.unwrap();
     let method = req.method.unwrap_or_default().to_owned();
     let path = req.path.unwrap_or_default().to_owned();
     let version = req.version.unwrap_or_default();
@@ -108,14 +109,10 @@ pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
         })
         .collect();
 
-    let body_reader = if let Some(encoding) = headers.get("transfer-encoding") {
-        if encoding == "chunked" {
-            BodyReader::Chunked
-        } else {
-            BodyReader::Fixed(0)
-        }
-    } else if let Some(length) = headers.get("content-length") {
-        BodyReader::Fixed(length.parse()?)
+    let body_reader = if is_chunked(&headers) {
+        BodyReader::Chunked
+    } else if let Some(length) = content_length(&headers) {
+        BodyReader::Fixed(length)
     } else {
         BodyReader::Fixed(0)
     };
@@ -127,6 +124,24 @@ pub fn parse_http_request(buf: &[u8]) -> Result<HttpRequest> {
         headers,
         body_reader,
     })
+}
+
+pub fn is_chunked(headers: &HashMap<String, String>) -> bool {
+    if let Some(encoding) = headers.get("transfer-encoding") {
+        if encoding == "chunked" {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn content_length(headers: &HashMap<String, String>) -> Option<usize> {
+    if let Some(length) = headers.get("content-length") {
+        Some(length.parse().ok()?)
+    } else {
+        None
+    }
 }
 
 pub fn request_is_complete(buf: &[u8]) -> Result<bool> {
